@@ -966,6 +966,184 @@ mod tests {
     }
 
     #[test]
+    fn test_transaction_source_info() {
+        let json: &str = r#"
+        {
+            "event_id": "c205189fa9d5405da5fa5187300bd372",
+            "project": 1,
+            "release": "22.9.5",
+            "dist": null,
+            "platform": "javascript",
+            "message": "",
+            "datetime": "2022-09-30T13:33:46.728000+00:00",
+            "_metrics": {
+                "bytes.ingested.event": 5648,
+                "bytes.stored.event": 7858
+            },
+            "breadcrumbs": {},
+            "tags": {
+                "transaction": "/"
+            },
+            "breakdowns": {
+            },
+            "contexts": {
+                "browser": {
+                "name": "Safari",
+                "version": "12.1.1",
+                "type": "browser"
+                },
+                "device": {
+                "family": "Mac",
+                "model": "Mac",
+                "brand": "Apple",
+                "type": "device"
+                },
+                "os": {
+                "name": "Mac OS X",
+                "version": "10.13.6",
+                "type": "os"
+                },
+                "trace": {
+                "trace_id": "5d88c70fd7c94ef3b7d4b3b2c0a72b66",
+                "span_id": "b3fecafdcc263cd5",
+                "op": "pageload",
+                "status": "ok",
+                "exclusive_time": 75.000286,
+                "client_sample_rate": 1,
+                "hash": "6666cd76f9695646",
+                "tags": {
+                    "routing.instrumentation": "react-router-v6",
+                    "sentry_reportAllChanges": false
+                },
+                "type": "trace"
+                }
+            },
+            "culprit": "/",
+            "environment": "production",
+            "grouping_config": {
+                "enhancements": "eJybzDRxY3J-bm5-npWRgaGlroGxrpHxBABcYgcZ",
+                "id": "newstyle:2019-10-29"
+            },
+            "hashes": [],
+            "key_id": "1662050",
+            "level": "info",
+            "location": "/",
+            "logger": "",
+            "metadata": {
+                "location": "/",
+                "title": "/"
+            },
+            "nodestore_insert": 1664544829.098673,
+            "received": 1664544826.792992,
+            "request": {
+                "url": "https://application-monitoring-react-dot-sales-engineering-sf.appspot.com/",
+                "query_string": ""
+            },
+            "sdk": {
+                "name": "sentry.javascript.react",
+                "version": "7.14.0",
+                "integrations": [
+                "InboundFilters",
+                "FunctionToString",
+                "TryCatch",
+                "Breadcrumbs",
+                "GlobalHandlers",
+                "LinkedErrors",
+                "Dedupe",
+                "HttpContext",
+                "BrowserTracing"
+                ],
+                "packages": [
+                {
+                    "name": "npm:@sentry/react",
+                    "version": "7.14.0"
+                }
+                ]
+            },
+            "span_grouping_config": {
+                "id": "default:2021-08-25"
+            },
+            "spans": [],
+            "start_timestamp": 1664544826.504,
+            "timestamp": 1664544826.728,
+            "title": "/",
+            "transaction": "/",
+            "transaction_info": {
+                "source": "route",
+                "changes": [
+                {
+                    "source": "url",
+                    "propagations": 1,
+                    "timestamp": 1664544826.728
+                }
+                ],
+                "propagations": 1
+            },
+            "type": "transaction",
+            "user": {
+                "email": "eud@gmail.com",
+                "ip_address": "66.85.48.74",
+                "geo": {
+                "country_code": "US",
+                "city": "Santa Clara",
+                "region": "United States"
+                }
+            },
+            "version": "7"
+            }
+        "#;
+
+
+
+        let config = TransactionMetricsConfig::default();
+        let event = Annotated::<Event>::from_json(json).unwrap();
+
+        let mut metrics = vec![];
+        extract_transaction_metrics(&config, &[], event.value().unwrap(), &mut metrics);
+
+        assert_eq!(metrics.len(), 2);
+        let transaction_name = metrics[0].tags.get("transaction").cloned();
+
+        assert_eq!(transaction_name, Some("/".to_owned()));
+
+        insta::assert_debug_snapshot!(metrics, @r###"
+        [
+            Metric {
+                name: "d:transactions/duration@millisecond",
+                value: Distribution(
+                    223.999977,
+                ),
+                timestamp: UnixTimestamp(1664544826),
+                tags: {
+                    "environment": "production",
+                    "platform": "javascript",
+                    "release": "22.9.5",
+                    "transaction": "/",
+                    "transaction.op": "pageload",
+                    "transaction.status": "ok",
+                },
+            },
+            Metric {
+                name: "s:transactions/user@none",
+                value: Set(
+                    2257961730,
+                ),
+                timestamp: UnixTimestamp(1664544826),
+                tags: {
+                    "environment": "production",
+                    "platform": "javascript",
+                    "release": "22.9.5",
+                    "transaction": "/",
+                    "transaction.op": "pageload",
+                    "transaction.status": "ok",
+                },
+            },
+        ]
+        "###);
+
+    }
+
+    #[test]
     fn test_user_satisfaction() {
         let json = r#"
         {
