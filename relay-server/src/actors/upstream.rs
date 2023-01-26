@@ -28,12 +28,14 @@ use relay_system::{
     Addr, AsyncResponse, FromMessage, Interface, MessageResponse, NoResponse, Sender, Service,
 };
 
-use crate::http::{HttpError, Request, RequestBuilder, Response, StatusCode};
 use crate::service::REGISTRY;
 use crate::statsd::{RelayHistograms, RelayTimers};
 use crate::utils::{self, ApiErrorResponse, RelayErrorAction};
 
-pub use reqwest::Method;
+// Directly expose types from reqwest that are used in the public signature of the `UpstreamRequest`
+// trait and related utilities.
+#[doc(inline)]
+pub use reqwest::{Method, Request, RequestBuilder, Response, StatusCode};
 
 /// Rate limits returned by the upstream.
 ///
@@ -102,14 +104,19 @@ pub enum UpstreamRequestError {
     #[error("attempted to send upstream request without credentials configured")]
     NoCredentials,
 
+    #[error("request payload exceeds the configured limit")]
+    PayloadTooLarge,
+
     /// As opposed to HTTP variant this contains all network errors.
     #[error("could not send request to upstream")]
     SendFailed(#[from] reqwest::Error),
 
-    /// Likely a bad HTTP status code or unparseable response.
-    #[error("could not send request")]
-    Http(#[source] HttpError),
+    #[error("failed to parse JSON response")]
+    Json(#[from] serde_json::Error),
 
+    // /// Likely a bad HTTP status code or unparseable response.
+    // #[error("could not send request")]
+    // Http(#[source] HttpError),
     #[error("upstream requests rate limited")]
     RateLimited(UpstreamRateLimits),
 
@@ -132,17 +139,18 @@ impl UpstreamRequestError {
     fn status_code(&self) -> Option<StatusCode> {
         match self {
             UpstreamRequestError::ResponseError(code, _) => Some(*code),
-            UpstreamRequestError::Http(HttpError::Reqwest(e)) => e.status(),
+            UpstreamRequestError::SendFailed(e) => e.status(),
             _ => None,
         }
     }
 
     /// Returns `true` if the error indicates a network downtime.
     fn is_network_error(&self) -> bool {
+        // TODO(ja): Be very careful about the Http variant, this has changed.
         match self {
-            Self::SendFailed(_) => true,
+            Self::SendFailed(_) => todo!(), // TODO(ja): is_network_error
             Self::ResponseError(code, _) => matches!(code.as_u16(), 502 | 503 | 504),
-            Self::Http(http) => http.is_network_error(),
+            // Self::Http(http) => http.is_network_error(),
             _ => false,
         }
     }
@@ -166,15 +174,20 @@ impl UpstreamRequestError {
     /// includes rate limits (status code 429), and bad payloads (4XX), but not network errors
     /// (502-504).
     pub fn is_received(&self) -> bool {
+        // TODO(ja): Careful for SendFailed
         match self {
             // Rate limits are a special case of `ResponseError(429, _)`.
             Self::RateLimited(_) => true,
+            // TODO(ja): ???
+            Self::Json(_) => true,
             // Everything except network errors indicates the upstream has handled this request.
-            Self::ResponseError(_, _) | Self::Http(_) => !self.is_network_error(),
+            Self::ResponseError(_, _) => !self.is_network_error(),
+            Self::SendFailed(_) => todo!(),
             // Remaining kinds indicate a failure to send the request.
-            Self::NoCredentials | Self::SendFailed(_) | Self::ChannelClosed | Self::AuthDenied => {
-                false
-            }
+            Self::NoCredentials
+            | Self::ChannelClosed
+            | Self::AuthDenied
+            | Self::PayloadTooLarge => false,
         }
     }
 
@@ -185,24 +198,13 @@ impl UpstreamRequestError {
         match self {
             UpstreamRequestError::NoCredentials => "credentials",
             UpstreamRequestError::SendFailed(_) => "send_failed",
-            UpstreamRequestError::Http(HttpError::Io(_)) => "payload_failed",
-            UpstreamRequestError::Http(HttpError::Json(_)) => "invalid_json",
-            UpstreamRequestError::Http(HttpError::Reqwest(_)) => "reqwest_error",
-            UpstreamRequestError::Http(HttpError::Overflow) => "overflow",
-            UpstreamRequestError::Http(HttpError::NoCredentials) => "no_credentials",
+            // UpstreamRequestError::Io(_) => "payload_failed",
+            UpstreamRequestError::Json(_) => "invalid_json",
+            UpstreamRequestError::PayloadTooLarge => "overflow",
             UpstreamRequestError::RateLimited(_) => "rate_limited",
             UpstreamRequestError::ResponseError(_, _) => "response_error",
             UpstreamRequestError::ChannelClosed => "channel_closed",
             UpstreamRequestError::AuthDenied => "auth_denied",
-        }
-    }
-}
-
-impl From<HttpError> for UpstreamRequestError {
-    fn from(error: HttpError) -> Self {
-        match error {
-            HttpError::NoCredentials => Self::NoCredentials,
-            other => Self::Http(other),
         }
     }
 }
@@ -321,7 +323,11 @@ pub trait UpstreamRequest: Send + Sync + fmt::Debug {
     /// Note that this function can be called repeatedly if [`retry`](UpstreamRequest::retry)
     /// returns `true`. This function should therefore not move out of the request struct, but can
     /// use it to memoize heavy computation.
-    fn build(&mut self, config: &Config, builder: RequestBuilder) -> Result<Request, HttpError>;
+    fn build(
+        &mut self,
+        config: &Config,
+        builder: RequestBuilder,
+    ) -> Result<Request, UpstreamRequestError>;
 
     /// Callback to complete an HTTP request.
     ///
@@ -448,9 +454,11 @@ where
         &mut self,
         config: &Config,
         mut builder: RequestBuilder,
-    ) -> Result<Request, HttpError> {
+    ) -> Result<Request, UpstreamRequestError> {
         // Memoize the serialized body and signature for retries.
-        let credentials = config.credentials().ok_or(HttpError::NoCredentials)?;
+        let credentials = config
+            .credentials()
+            .ok_or(UpstreamRequestError::NoCredentials)?;
         let (body, signature) = self
             .compiled
             .get_or_insert_with(|| credentials.secret_key.pack(&self.query));
@@ -464,8 +472,9 @@ where
         );
 
         builder.header("X-Sentry-Relay-Signature", signature.as_bytes());
-        builder.header(header::CONTENT_TYPE, b"application/json");
-        builder.body(&body)
+        builder.header(header::CONTENT_TYPE, b"application/json".as_slice());
+        builder.body(body.as_slice()); // TODO(ja): Use `Bytes` and clone them.
+        Ok(builder.build()?)
     }
 
     fn respond(
@@ -639,8 +648,12 @@ impl UpstreamRequest for GetHealthCheck {
         "check_live"
     }
 
-    fn build(&mut self, _: &Config, builder: RequestBuilder) -> Result<Request, HttpError> {
-        builder.finish()
+    fn build(
+        &mut self,
+        _: &Config,
+        builder: RequestBuilder,
+    ) -> Result<Request, UpstreamRequestError> {
+        builder.build()
     }
 
     fn respond(
