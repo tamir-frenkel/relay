@@ -12,6 +12,7 @@ use chrono::{DateTime, Duration as SignedDuration, Utc};
 use flate2::write::{GzEncoder, ZlibEncoder};
 use flate2::Compression;
 use once_cell::sync::OnceCell;
+use relay_statsd::alloc::RelayMemoryUseCase;
 use serde_json::Value as SerdeValue;
 use tokio::sync::Semaphore;
 
@@ -2397,6 +2398,8 @@ impl EnvelopeProcessorService {
     }
 
     fn process_state(&self, state: &mut ProcessEnvelopeState) -> Result<(), ProcessingError> {
+        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::StoreNormalizer);
+
         macro_rules! if_processing {
             ($if_true:block) => {
                 #[cfg(feature = "processing")] {

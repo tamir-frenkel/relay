@@ -111,10 +111,6 @@ use std::process;
 
 use relay_log::Hub;
 
-#[cfg(target_os = "linux")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 pub fn main() {
     let exit_code = match cli::execute() {
         Ok(()) => 0,

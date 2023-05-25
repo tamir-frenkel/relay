@@ -7,6 +7,7 @@ use relay_log::LogError;
 use relay_metrics::{self, Aggregator, FlushBuckets, InsertMetrics, MergeBuckets};
 use relay_quotas::RateLimits;
 use relay_redis::RedisPool;
+use relay_statsd::alloc::RelayMemoryUseCase;
 use relay_statsd::metric;
 use relay_system::{Addr, FromMessage, Interface, Sender, Service};
 use tokio::sync::mpsc;
@@ -525,6 +526,7 @@ impl ProjectCacheBroker {
     /// a project that has expired recently and for which a fetch is already underway in
     /// [`super::project_upstream`].
     fn evict_stale_project_caches(&mut self) {
+        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::ProjectState);
         let eviction_start = Instant::now();
         let delta = 2 * self.config.project_cache_expiry() + self.config.project_grace_period();
 
@@ -553,6 +555,7 @@ impl ProjectCacheBroker {
 
     fn get_or_create_project(&mut self, project_key: ProjectKey) -> &mut Project {
         metric!(histogram(RelayHistograms::ProjectStateCacheSize) = self.projects.len() as u64);
+        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::ProjectState);
 
         let config = self.config.clone();
 

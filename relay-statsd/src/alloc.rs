@@ -1,9 +1,17 @@
+use std::alloc::GlobalAlloc;
+use std::time::Duration;
+
+pub use memoria::StatsRecorder;
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+
+use crate::metric;
 use crate::CounterMetric;
+
+use memoria::{Alloc, UseCase};
 
 pub enum AllocCounters {
     /// Tracks memory allocated and deallocated
     Alloc,
-    DeallocGlitch,
     Error,
 }
 
@@ -11,69 +19,55 @@ impl CounterMetric for AllocCounters {
     fn name(&self) -> &'static str {
         match *self {
             AllocCounters::Alloc => "alloc",
-            AllocCounters::DeallocGlitch => "dealloc_glitch",
             AllocCounters::Error => "error",
         }
     }
 }
 
-memento::usecase! {
-    pub enum RelayMemoryUseCase {
-        default None,
-        StoreNormalizer,
-        MetricsAggregator,
-        SessionMetricsExtraction,
-        ProjectState,
-    }
-
-    impl memento::UseCase for RelayMemoryUseCase {
-        fn on_alloc(&self, size: usize) {
-            if matches!(self, RelayMemoryUseCase::None) {
-                return;
-            }
-
-            let _usecase = Allocator::with_usecase(RelayMemoryUseCase::None);
-
-            metric!(
-                counter(AllocCounters::Alloc) += size as i64,
-                use_case = self.as_str()
-            );
-        }
-
-        fn on_dealloc(&self, size: usize) {
-            if matches!(self, RelayMemoryUseCase::None) {
-                return;
-            }
-            let _usecase = Allocator::with_usecase(RelayMemoryUseCase::None);
-
-            metric!(
-                counter(AllocCounters::Alloc) -= size as i64,
-                use_case = self.as_str()
-            );
-        }
-
-        fn on_dealloc_glitch() {
-            let _usecase = Allocator::with_usecase(RelayMemoryUseCase::None);
-            metric!(counter(AllocCounters::DeallocGlitch) += 1);
-        }
-
-        fn on_error() {
-            // metric!(counter(AllocCounters::Error) += 1);
-        }
-    }
+#[derive(TryFromPrimitive, IntoPrimitive, Default, Debug)]
+#[repr(u32)]
+pub enum RelayMemoryUseCase {
+    #[default]
+    None,
+    StoreNormalizer,
+    ProjectState,
 }
+
+impl UseCase for RelayMemoryUseCase {}
 
 impl RelayMemoryUseCase {
     fn as_str(&self) -> &'static str {
         match self {
             RelayMemoryUseCase::None => "none",
             RelayMemoryUseCase::StoreNormalizer => "store_normalizer",
-            RelayMemoryUseCase::MetricsAggregator => "metrics_aggregator",
-            RelayMemoryUseCase::SessionMetricsExtraction => "session_metrics_extraction",
             RelayMemoryUseCase::ProjectState => "project_state",
         }
     }
 }
 
-pub type Allocator = memento::Alloc<RelayMemoryUseCase>;
-pub use memento::new as new_allocator;
+pub type Allocator<A> = Alloc<RelayMemoryUseCase, StatsRecorder<RelayMemoryUseCase>, A>;
+
+pub fn launch_statsd_memory_thread<A: GlobalAlloc + Send + Sync>(allocator: &'static Allocator<A>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(1));
+        allocator
+            .with_recorder(|recorder| {
+                recorder.flush(
+                    |use_case, stat| {
+                        metric!(
+                            counter(AllocCounters::Alloc) += stat.current as i64,
+                            use_case = use_case.as_str()
+                        );
+                    },
+                    |err, count| {
+                        metric!(
+                            counter(AllocCounters::Error) += count as i64,
+                            error_code = &format!("{:?}", err)
+                        );
+                    },
+                );
+                Ok(())
+            })
+            .ok();
+    });
+}

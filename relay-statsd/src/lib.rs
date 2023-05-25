@@ -155,6 +155,8 @@ pub mod prelude {
     pub use cadence::prelude::*;
 }
 
+pub mod alloc;
+
 /// Set a new statsd client.
 pub fn set_client(client: MetricsClient) {
     *METRICS_CLIENT.write() = Some(Arc::new(client));

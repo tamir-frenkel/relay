@@ -254,6 +254,7 @@
 #![allow(clippy::derive_partial_eq_without_eq)]
 
 mod actors;
+mod alloc;
 mod constants;
 mod endpoints;
 mod envelope;
