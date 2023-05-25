@@ -7,9 +7,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{format_err, Context, Result};
-use structopt::clap::AppSettings;
-use structopt::StructOpt;
-
+use clap::Parser;
 use relay_general::pii::{PiiAttachmentsProcessor, PiiConfig};
 
 /// Apply data scrubbing (PII) rules on a minidump file.
@@ -28,18 +26,18 @@ use relay_general::pii::{PiiAttachmentsProcessor, PiiConfig};
 ///
 /// For more information on how to scrub IP addresses, user file paths and how to define custom
 /// regexes see <https://getsentry.github.io/relay/pii-config/>
-#[derive(Debug, StructOpt)]
-#[structopt(verbatim_doc_comment, setting = AppSettings::ColoredHelp)]
+#[derive(Debug, Parser)]
+#[structopt(verbatim_doc_comment)]
 struct Cli {
     /// Path to a PII config JSON file.
-    #[structopt(short, long, value_name = "PATH")]
+    #[arg(short, long)]
     config: PathBuf,
 
     /// Path to the minidump to rewrite.
     minidump: PathBuf,
 
     /// Optional output path. By default, the minidump file is overwritten.
-    #[structopt(short, long, value_name = "PATH")]
+    #[arg(short, long)]
     output: Option<PathBuf>,
 }
 
@@ -78,8 +76,7 @@ impl Cli {
 
     pub fn run(self) -> Result<()> {
         let config = self.load_pii_config()?;
-        let compiled = config.compiled();
-        let processor = PiiAttachmentsProcessor::new(&compiled);
+        let processor = PiiAttachmentsProcessor::new(config.compiled());
 
         let mut data = self.load_minidump()?;
         let changed = processor
@@ -97,17 +94,18 @@ impl Cli {
 }
 
 fn print_error(error: &anyhow::Error) {
-    eprintln!("Error: {}", error);
+    eprintln!("Error: {error}");
 
     let mut cause = error.source();
     while let Some(ref e) = cause {
-        eprintln!("  caused by: {}", e);
+        eprintln!("  caused by: {e}");
         cause = e.source();
     }
 }
 
-#[paw::main]
-fn main(cli: Cli) {
+fn main() {
+    let cli = Cli::parse();
+
     match cli.run() {
         Ok(()) => (),
         Err(error) => {

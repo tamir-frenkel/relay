@@ -1,59 +1,103 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::ops::Deref;
 
+use once_cell::sync::OnceCell;
 use regex::{Regex, RegexBuilder};
-use relay_common::{LazyCellRef, UpsertingLazyCell};
-use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
+use relay_log::LogError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::pii::{CompiledPiiConfig, Redaction};
 use crate::processor::SelectorSpec;
 
-/// A regex pattern for text replacement.
-#[derive(Clone)]
-pub struct Pattern(pub Regex);
+const COMPILED_PATTERN_MAX_SIZE: usize = 262_144;
 
-impl Deref for Pattern {
-    type Target = Regex;
+/// Helper method to check whether a flag is false.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn is_flag_default(flag: &bool) -> bool {
+    !*flag
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum PiiConfigError {
+    #[error("could not parse pattern")]
+    RegexError(#[source] regex::Error),
+}
+
+/// Wrapper for the regex and the raw pattern string.
+///
+/// The regex will be compiled only when it used once, and the compiled version will be reused on
+/// consecutive calls.
+#[derive(Debug, Clone)]
+pub struct LazyPattern {
+    raw: Cow<'static, str>,
+    case_insensitive: bool,
+    pattern: OnceCell<Result<Regex, PiiConfigError>>,
+}
+
+impl PartialEq for LazyPattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw.to_lowercase() == other.raw.to_lowercase()
     }
 }
 
-impl From<&'static str> for Pattern {
-    fn from(pattern: &'static str) -> Pattern {
-        Pattern(Regex::new(pattern).unwrap())
+impl LazyPattern {
+    /// Create a new [`LazyPattern`] from a raw string.
+    pub fn new<S>(raw: S) -> Self
+    where
+        Cow<'static, str>: From<S>,
+    {
+        Self {
+            raw: raw.into(),
+            case_insensitive: false,
+            pattern: OnceCell::new(),
+        }
+    }
+
+    /// Change the case sensativity settings for the underlying regex.
+    ///
+    /// It's possible to set the case sensativity on already compiled [`LazyPattern`], which will
+    /// be recompiled (re-built) once it's used again.
+    pub fn case_insensitive(mut self, value: bool) -> Self {
+        self.case_insensitive = value;
+        self.pattern.take();
+        self
+    }
+
+    /// Compiles the regex from the internal raw string.
+    pub fn compiled(&self) -> Result<&Regex, &PiiConfigError> {
+        self.pattern
+            .get_or_init(|| {
+                let regex_result = RegexBuilder::new(&self.raw)
+                    .size_limit(COMPILED_PATTERN_MAX_SIZE)
+                    .case_insensitive(self.case_insensitive)
+                    .build()
+                    .map_err(PiiConfigError::RegexError);
+
+                if let Err(ref err) = regex_result {
+                    relay_log::error!("Unable to compile pattern into regex: {}", LogError(err));
+                }
+                regex_result
+            })
+            .as_ref()
     }
 }
 
-impl fmt::Debug for Pattern {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, f)
+impl From<&'static str> for LazyPattern {
+    fn from(pattern: &'static str) -> LazyPattern {
+        LazyPattern::new(pattern)
     }
 }
 
-impl Serialize for Pattern {
+impl Serialize for LazyPattern {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0.to_string())
+        serializer.serialize_str(&self.raw)
     }
 }
 
-impl<'de> Deserialize<'de> for Pattern {
+impl<'de> Deserialize<'de> for LazyPattern {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        let pattern = RegexBuilder::new(&raw)
-            .size_limit(262_144)
-            .build()
-            .map_err(Error::custom)?;
-        Ok(Pattern(pattern))
-    }
-}
-
-impl PartialEq for Pattern {
-    fn eq(&self, other: &Pattern) -> bool {
-        // unclear if we could derive Eq as well, but better not. We don't need it.
-        self.0.as_str() == other.0.as_str()
+        Ok(LazyPattern::new(raw))
     }
 }
 
@@ -69,7 +113,7 @@ fn replace_groups_default() -> Option<BTreeSet<u8>> {
 #[serde(rename_all = "camelCase")]
 pub struct PatternRule {
     /// The regular expression to apply.
-    pub pattern: Pattern,
+    pub pattern: LazyPattern,
     /// The match group indices to replace.
     #[serde(default = "replace_groups_default")]
     pub replace_groups: Option<BTreeSet<u8>>,
@@ -82,7 +126,7 @@ pub struct MultipleRule {
     /// A reference to other rules to apply
     pub rules: Vec<String>,
     /// When set to true, the outer rule is reported.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_flag_default")]
     pub hide_inner: bool,
 }
 
@@ -93,7 +137,7 @@ pub struct AliasRule {
     /// A reference to another rule to apply.
     pub rule: String,
     /// When set to true, the outer rule is reported.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_flag_default")]
     pub hide_inner: bool,
 }
 
@@ -102,7 +146,7 @@ pub struct AliasRule {
 #[serde(rename_all = "camelCase")]
 pub struct RedactPairRule {
     /// A pattern to match for keys.
-    pub key_pattern: Pattern,
+    pub key_pattern: LazyPattern,
 }
 
 /// Supported stripping rules.
@@ -125,6 +169,8 @@ pub enum RuleType {
     Ip,
     /// Matches a creditcard number
     Creditcard,
+    /// Matches an IBAN
+    Iban,
     /// Sanitizes a path from user data
     Userpath,
     /// A PEM encoded key
@@ -142,6 +188,8 @@ pub enum RuleType {
     Multiple(MultipleRule),
     /// Applies another rule.  Works like a single multiple.
     Alias(AliasRule),
+    /// Unknown ruletype for forward compatibility
+    Unknown(String),
 }
 
 /// A single rule configuration.
@@ -158,30 +206,36 @@ pub struct RuleSpec {
 #[serde(rename_all = "camelCase")]
 pub struct Vars {
     /// The default secret key for hashing operations.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash_key: Option<String>,
+}
+
+impl Vars {
+    fn is_empty(&self) -> bool {
+        self.hash_key.is_none()
+    }
 }
 
 /// A set of named rule configurations.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct PiiConfig {
     /// A map of custom PII rules.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rules: BTreeMap<String, RuleSpec>,
 
     /// Parameters for PII rules.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vars::is_empty")]
     pub vars: Vars,
 
     /// Mapping of selectors to rules.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub applications: BTreeMap<SelectorSpec, Vec<String>>,
 
     /// PII config derived from datascrubbing settings.
     ///
     /// Cached because the conversion process is expensive.
     #[serde(skip)]
-    pub(super) compiled: UpsertingLazyCell<CompiledPiiConfig>,
+    pub(super) compiled: OnceCell<CompiledPiiConfig>,
 }
 
 impl PartialEq for PiiConfig {
@@ -215,15 +269,15 @@ impl PiiConfig {
         serde_json::to_string_pretty(&self)
     }
 
-    /// Get a representation of the `PiiConfig` that is more (CPU-)efficient for processing. Result
-    /// is cached in lazycell and directly returned on second call.
-    pub fn compiled(&self) -> LazyCellRef<CompiledPiiConfig> {
-        self.compiled
-            .get_or_insert_with(|| self.compiled_uncached())
+    /// Get a representation of this `PiiConfig` that is more (CPU-)efficient for processing.
+    ///
+    /// This can be computationally expensive when called for the first time. The result is cached
+    /// internally and reused on the second call.
+    pub fn compiled(&self) -> &CompiledPiiConfig {
+        self.compiled.get_or_init(|| self.compiled_uncached())
     }
 
-    /// Like `self.compiled` but without internal caching. Useful for benchmarks but not much
-    /// else.
+    /// Like [`compiled`](Self::compiled) but without internal caching.
     #[inline]
     pub fn compiled_uncached(&self) -> CompiledPiiConfig {
         CompiledPiiConfig::new(self)

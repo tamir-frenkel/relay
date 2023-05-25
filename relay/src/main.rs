@@ -21,9 +21,10 @@
 //!
 //! # Feature Flags
 //!
-//! - `ssl` _(default)_: Enables SSL support using `native-tls`.
 //! - `processing`: Includes event ingestion and processing functionality. This should only be
 //!   specified when compiling Relay as Sentry service. Standalone Relays do not need this feature.
+//! - `crash-handler`: Allows native crash reporting for segfaults and out-of-memory situations when
+//!   internal error reporting to Sentry is enabled.
 //!
 //! # Workspace Crates
 //!
@@ -31,18 +32,24 @@
 //!
 //!  - `relay`: Main entry point and command line interface.
 //!  - [`relay-auth`]: Authentication and crypto.
+//!  - [`relay-aws-extension`]: AWS extension implementation for Sentry's AWS Lambda layer.
 //!  - [`relay-cabi`]: C-bindings for exposing functionality to Python.
 //!  - [`relay-common`]: Common utilities and crate re-exports.
-//!  - [`relay-config`]: Configuration for the CLI and server.
+//!  - [`relay-config`]: Static configuration for the CLI and server.
 //!  - [`relay-crash`]: Crash reporting for the Relay server.
+//!  - [`relay-monitors`]: Monitors protocol and processing for Sentry.
+//!  - [`relay-dynamic-config`]: Dynamic configuration passed from Sentry.
 //!  - [`relay-ffi`]: Utilities for error handling in FFI bindings.
 //!  - [`relay-ffi-macros`]: Macros for error handling in FFI bindings.
 //!  - [`relay-filter`]: Inbound data filters.
 //!  - [`relay-general`]: Event protocol, normalization and data scrubbing.
+//!  - [`relay-kafka`]: Kafka-related functionality.
 //!  - [`relay-log`]: Error reporting and logging.
 //!  - [`relay-metrics`]: Metrics protocol and processing.
+//!  - [`relay-profiling`]: Profiling protocol and processing.
 //!  - [`relay-quotas`]: Sentry quotas and rate limiting.
 //!  - [`relay-redis`]: Pooled Redis and Redis cluster abstraction.
+//!  - [`relay-replays`]: Session replay protocol and processing.
 //!  - [`relay-sampling`]: Dynamic sampling functionality.
 //!  - [`relay-statsd`]: High-level StatsD metric client for internal measurements.
 //!  - [`relay-server`]: Endpoints and services.
@@ -61,18 +68,24 @@
 //!
 //! [relay documentation]: https://docs.sentry.io/product/relay/
 //! [`relay-auth`]: ../relay_auth/index.html
+//! [`relay-aws-extension`]: ../relay_aws_extension/index.html
 //! [`relay-cabi`]: ../relay_cabi/index.html
 //! [`relay-common`]: ../relay_common/index.html
 //! [`relay-config`]: ../relay_config/index.html
 //! [`relay-crash`]: ../relay_crash/index.html
+//! [`relay-monitors`]: ../relay_monitors/index.html
+//! [`relay-dynamic-config`]: ../relay_dynamic_config/index.html
 //! [`relay-ffi`]: ../relay_ffi/index.html
 //! [`relay-ffi-macros`]: ../relay_ffi_macros/index.html
 //! [`relay-filter`]: ../relay_filter/index.html
 //! [`relay-general`]: ../relay_general/index.html
+//! [`relay-kafka`]: ../relay_kafka/index.html
 //! [`relay-log`]: ../relay_log/index.html
 //! [`relay-metrics`]: ../relay_metrics/index.html
+//! [`relay-profiling`]: ../relay_profiling/index.html
 //! [`relay-quotas`]: ../relay_quotas/index.html
 //! [`relay-redis`]: ../relay_redis/index.html
+//! [`relay-replays`]: ../relay_replays/index.html
 //! [`relay-sampling`]: ../relay_sampling/index.html
 //! [`relay-statsd`]: ../relay_statsd/index.html
 //! [`relay-server`]: ../relay_server/index.html
@@ -87,6 +100,7 @@
     html_logo_url = "https://raw.githubusercontent.com/getsentry/relay/master/artwork/relay-icon.png",
     html_favicon_url = "https://raw.githubusercontent.com/getsentry/relay/master/artwork/relay-icon.png"
 )]
+#![allow(clippy::derive_partial_eq_without_eq)]
 
 mod cli;
 mod cliapp;
@@ -96,6 +110,10 @@ mod utils;
 use std::process;
 
 use relay_log::Hub;
+
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 pub fn main() {
     let exit_code = match cli::execute() {

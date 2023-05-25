@@ -1,39 +1,83 @@
 use std::collections::BTreeMap;
 
-use regex::RegexBuilder;
+use once_cell::sync::Lazy;
 
 use crate::pii::{
-    DataScrubbingConfig, Pattern, PiiConfig, RedactPairRule, Redaction, RuleSpec, RuleType, Vars,
+    DataScrubbingConfig, LazyPattern, PiiConfig, PiiConfigError, RedactPairRule, Redaction,
+    RuleSpec, RuleType, Vars,
 };
 use crate::processor::{SelectorPathItem, SelectorSpec, ValueType};
 
-lazy_static::lazy_static! {
-    // XXX: Move to @ip rule for better IP address scrubbing. Right now we just try to keep
-    // compatibility with Python.
-    static ref KNOWN_IP_FIELDS: SelectorSpec = "($request.env.REMOTE_ADDR | $user.ip_address | $sdk.client_ip)".parse().unwrap();
+/// Fields that the legacy data scrubber cannot strip.
+///
+/// We define this list independently of `metastructure(pii = true/false)` because the new PII
+/// scrubber should be able to strip more.
+static DATASCRUBBER_IGNORE: Lazy<SelectorSpec> = Lazy::new(|| {
+    "(debug_meta.** | $frame.filename | $frame.abs_path | $logentry.formatted | $error.value)"
+        .parse()
+        .unwrap()
+});
 
-    // Fields that the legacy data scrubber cannot strip. We define this list independently of
-    // `metastructure(pii = true/false)` because the new PII scrubber should be able to strip more.
-    static ref DATASCRUBBER_IGNORE: SelectorSpec = "( \
-          debug_meta.** \
-        | $frame.filename \
-        | $frame.abs_path \
-        | $logentry.formatted \
-        | $error.value \
-    )".parse().unwrap();
-}
+/// Fields that are known to contain IPs. Used for legacy IP scrubbing.
+static KNOWN_IP_FIELDS: Lazy<SelectorSpec> = Lazy::new(|| {
+    "($request.env.REMOTE_ADDR | $user.ip_address | $sdk.client_ip)"
+        .parse()
+        .unwrap()
+});
 
-pub fn to_pii_config(datascrubbing_config: &DataScrubbingConfig) -> Option<PiiConfig> {
+static SENSITIVE_COOKIES: Lazy<SelectorSpec> = Lazy::new(|| {
+    [
+        // Common session cookie names for popular web frameworks
+        "*.cookies.sentrysid", // Sentry default session cookie name
+        "*.cookies.sudo",      // Sentry default sudo cookie name
+        "*.cookies.su",        // Sentry superuser cookie name
+        "*.cookies.session",
+        "*.cookies.__session",
+        "*.cookies.sessionid",
+        "*.cookies.user_session",
+        "*.cookies.symfony",
+        "*.cookies.phpsessid",
+        "*.cookies.fasthttpsessionid",
+        "*.cookies.mysession",
+        "*.cookies.irissessionid",
+        // Common CSRF/XSRF cookie names for popular web frameworks
+        "*.cookies.csrf",
+        "*.cookies.xsrf",
+        "*.cookies._xsrf",
+        "*.cookies._csrf",
+        "*.cookies.csrf-token",
+        "*.cookies.csrf_token",
+        "*.cookies.xsrf-token",
+        "*.cookies.xsrf_token",
+        "*.cookies.fastcsrf",
+        "*.cookies._iris_csrf",
+    ]
+    .join("|")
+    .parse()
+    .unwrap()
+});
+
+pub fn to_pii_config(
+    datascrubbing_config: &DataScrubbingConfig,
+) -> Result<Option<PiiConfig>, PiiConfigError> {
     let mut custom_rules = BTreeMap::new();
     let mut applied_rules = Vec::new();
     let mut applications = BTreeMap::new();
 
     if datascrubbing_config.scrub_data && datascrubbing_config.scrub_defaults {
         applied_rules.push("@common:filter".to_owned());
+        applications.insert(
+            SENSITIVE_COOKIES.clone(),
+            vec!["@anything:filter".to_owned()],
+        );
     }
 
     if datascrubbing_config.scrub_ip_addresses {
+        // legacy(?) scrubs all fields that are known to have IPs regardless of actual content
         applications.insert(KNOWN_IP_FIELDS.clone(), vec!["@anything:remove".to_owned()]);
+
+        // checks actual contents of all fields and scrubs where there is an IP address
+        applied_rules.push("@ip:replace".to_owned());
     }
 
     if datascrubbing_config.scrub_data {
@@ -67,12 +111,7 @@ pub fn to_pii_config(datascrubbing_config: &DataScrubbingConfig) -> Option<PiiCo
                 "strip-fields".to_owned(),
                 RuleSpec {
                     ty: RuleType::RedactPair(RedactPairRule {
-                        key_pattern: Pattern(
-                            RegexBuilder::new(&key_pattern)
-                                .case_insensitive(true)
-                                .build()
-                                .unwrap(),
-                        ),
+                        key_pattern: LazyPattern::new(key_pattern).case_insensitive(true),
                     }),
                     redaction: Redaction::Replace("[Filtered]".to_owned().into()),
                 },
@@ -83,7 +122,7 @@ pub fn to_pii_config(datascrubbing_config: &DataScrubbingConfig) -> Option<PiiCo
     }
 
     if applied_rules.is_empty() && applications.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let mut conjunctions = vec![
@@ -91,6 +130,7 @@ pub fn to_pii_config(datascrubbing_config: &DataScrubbingConfig) -> Option<PiiCo
             ValueType::String.into(),
             ValueType::Number.into(),
             ValueType::Array.into(),
+            ValueType::Object.into(),
         ]),
         SelectorSpec::Not(Box::new(DATASCRUBBER_IGNORE.clone())),
     ];
@@ -113,44 +153,36 @@ pub fn to_pii_config(datascrubbing_config: &DataScrubbingConfig) -> Option<PiiCo
         applications.insert(applied_selector, applied_rules);
     }
 
-    Some(PiiConfig {
+    Ok(Some(PiiConfig {
         rules: custom_rules,
         vars: Vars::default(),
         applications,
         ..Default::default()
-    })
+    }))
 }
 
 #[cfg(test)]
 mod tests {
+    use similar_asserts::assert_eq;
+
+    use super::to_pii_config as to_pii_config_impl;
     /// These tests are ported from Sentry's Python testsuite (test_data_scrubber). Each testcase
     /// has an equivalent testcase in Python.
     use crate::pii::{DataScrubbingConfig, PiiConfig, PiiProcessor};
     use crate::processor::{process_value, ProcessingState};
     use crate::protocol::Event;
+    use crate::store::{StoreConfig, StoreProcessor};
+    use crate::testutils::assert_annotated_snapshot;
     use crate::types::FromValue;
 
-    use super::to_pii_config as to_pii_config_impl;
-
     fn to_pii_config(datascrubbing_config: &DataScrubbingConfig) -> Option<PiiConfig> {
-        let rv = to_pii_config_impl(datascrubbing_config);
+        let rv = to_pii_config_impl(datascrubbing_config).unwrap();
         if let Some(ref config) = rv {
             let roundtrip: PiiConfig =
                 serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
-            assert_eq_dbg!(&roundtrip, config);
+            assert_eq!(&roundtrip, config);
         }
         rv
-    }
-
-    lazy_static::lazy_static! {
-        static ref SENSITIVE_VARS: serde_json::Value = serde_json::json!({
-            "foo": "bar",
-            "password": "hello",
-            "the_secret": "hello",
-            "a_password_here": "hello",
-            "api_key": "secret_key",
-            "apiKey": "secret_key",
-        });
     }
 
     static PUBLIC_KEY: &str = r#"""-----BEGIN PUBLIC KEY-----
@@ -179,6 +211,47 @@ zN87YGV0VMTG6ehxnkI4Fg6i0JPU3QIDAQABAoICAQCoCPjlYrODRU+vd2YeU/gM
 THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
 -----END RSA PRIVATE KEY-----"""#;
 
+    fn sensitive_vars() -> serde_json::Value {
+        serde_json::json!({
+            "foo": "bar",
+            "password": "hello",
+            "the_secret": "hello",
+            "a_password_here": "hello",
+            "api_key": "secret_key",
+            "apiKey": "secret_key",
+        })
+    }
+
+    fn sensitive_cookies() -> serde_json::Value {
+        serde_json::json!({
+        // Common session cookie names for popular web frameworks
+        "sentrysid": "my sentrysid", // Sentry default session cookie name
+        "sudo": "my sudo",   // Sentry default sudo cookie name
+        "su": "my su",    // Sentry superuser cookie name
+        "session": "my session",
+        "__session": "my __session",
+        "sessionid": "my sessionid",
+        "user_session": "my user_session",
+        "symfony": "my symfony",
+        "phpsessid": "my phpsessid",
+        "fasthttpsessionid": "my fasthttpsessionid",
+        "mysession": "my mysession",
+        "irissessionid": "my irissessionid",
+        // Common CSRF/XSRF cookie names for popular web frameworks
+        "csrf": "my csrf",
+        "xsrf": "my xsrf",
+        "_xsrf": "my _xsrf",
+        "_csrf": "my _csrf",
+        "csrf-token": "my csrf-token",
+        "csrf_token": "my csrf_token",
+        "xsrf-token": "my  xsrf-token",
+        "xsrf_token": "my  xsrf_token",
+        "fastcsrf": "my fastcsrf",
+        "_iris_csrf": "my _iris_csrf",
+        "not_sensitive": "keep this",
+        })
+    }
+
     fn simple_enabled_pii_config() -> PiiConfig {
         to_pii_config(&simple_enabled_config()).unwrap()
     }
@@ -201,16 +274,16 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
     fn test_convert_default_pii_config() {
         insta::assert_json_snapshot!(simple_enabled_pii_config(), @r###"
         {
-          "rules": {},
-          "vars": {
-            "hashKey": null
-          },
           "applications": {
-            "($string || $number || $array) && !(debug_meta.** || $frame.filename || $frame.abs_path || $logentry.formatted || $error.value)": [
-              "@common:filter"
+            "($string || $number || $array || $object) && !(debug_meta.** || $frame.filename || $frame.abs_path || $logentry.formatted || $error.value)": [
+              "@common:filter",
+              "@ip:replace"
             ],
             "$http.env.REMOTE_ADDR || $user.ip_address || $sdk.client_ip": [
               "@anything:remove"
+            ],
+            "*.cookies.sentrysid || *.cookies.sudo || *.cookies.su || *.cookies.session || *.cookies.__session || *.cookies.sessionid || *.cookies.user_session || *.cookies.symfony || *.cookies.phpsessid || *.cookies.fasthttpsessionid || *.cookies.mysession || *.cookies.irissessionid || *.cookies.csrf || *.cookies.xsrf || *.cookies._xsrf || *.cookies._csrf || *.cookies.csrf-token || *.cookies.csrf_token || *.cookies.xsrf-token || *.cookies.xsrf_token || *.cookies.fastcsrf || *.cookies._iris_csrf": [
+              "@anything:filter"
             ]
           }
         }
@@ -226,16 +299,16 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
 
         insta::assert_json_snapshot!(pii_config, @r###"
         {
-          "rules": {},
-          "vars": {
-            "hashKey": null
-          },
           "applications": {
-            "($string || $number || $array) && !(debug_meta.** || $frame.filename || $frame.abs_path || $logentry.formatted || $error.value)": [
-              "@common:filter"
+            "($string || $number || $array || $object) && !(debug_meta.** || $frame.filename || $frame.abs_path || $logentry.formatted || $error.value)": [
+              "@common:filter",
+              "@ip:replace"
             ],
             "$http.env.REMOTE_ADDR || $user.ip_address || $sdk.client_ip": [
               "@anything:remove"
+            ],
+            "*.cookies.sentrysid || *.cookies.sudo || *.cookies.su || *.cookies.session || *.cookies.__session || *.cookies.sessionid || *.cookies.user_session || *.cookies.symfony || *.cookies.phpsessid || *.cookies.fasthttpsessionid || *.cookies.mysession || *.cookies.irissessionid || *.cookies.csrf || *.cookies.xsrf || *.cookies._xsrf || *.cookies._csrf || *.cookies.csrf-token || *.cookies.csrf_token || *.cookies.xsrf-token || *.cookies.xsrf_token || *.cookies.fastcsrf || *.cookies._iris_csrf": [
+              "@anything:filter"
             ]
           }
         }
@@ -261,20 +334,51 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
               }
             }
           },
-          "vars": {
-            "hashKey": null
-          },
           "applications": {
-            "($string || $number || $array) && !(debug_meta.** || $frame.filename || $frame.abs_path || $logentry.formatted || $error.value)": [
+            "($string || $number || $array || $object) && !(debug_meta.** || $frame.filename || $frame.abs_path || $logentry.formatted || $error.value)": [
               "@common:filter",
+              "@ip:replace",
               "strip-fields"
             ],
             "$http.env.REMOTE_ADDR || $user.ip_address || $sdk.client_ip": [
               "@anything:remove"
+            ],
+            "*.cookies.sentrysid || *.cookies.sudo || *.cookies.su || *.cookies.session || *.cookies.__session || *.cookies.sessionid || *.cookies.user_session || *.cookies.symfony || *.cookies.phpsessid || *.cookies.fasthttpsessionid || *.cookies.mysession || *.cookies.irissessionid || *.cookies.csrf || *.cookies.xsrf || *.cookies._xsrf || *.cookies._csrf || *.cookies.csrf-token || *.cookies.csrf_token || *.cookies.xsrf-token || *.cookies.xsrf_token || *.cookies.fastcsrf || *.cookies._iris_csrf": [
+              "@anything:filter"
             ]
           }
         }
         "###);
+    }
+
+    #[test]
+    fn test_convert_sensitive_fields_too_large() {
+        let mut data = Event::from_value(
+            serde_json::json!({
+                "user": {
+                    "data": {
+                        "1": "test"
+                    }
+                }
+            })
+            .into(),
+        );
+
+        let config = to_pii_config_impl(&DataScrubbingConfig {
+            sensitive_fields: vec!["1"]
+                .repeat(99999) // lowest number that will fail
+                .into_iter()
+                .map(|x| x.to_string())
+                .collect(),
+            ..simple_enabled_config()
+        })
+        .unwrap()
+        .unwrap();
+
+        let mut pii_processor = PiiProcessor::new(config.compiled());
+        process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
+        // The data won't be scrubbed here, since the regex cannot be compiled.
+        assert_annotated_snapshot!(data);
     }
 
     #[test]
@@ -286,16 +390,16 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
 
         insta::assert_json_snapshot!(pii_config, @r###"
         {
-          "rules": {},
-          "vars": {
-            "hashKey": null
-          },
           "applications": {
-            "($string || $number || $array) && !(debug_meta.** || $frame.filename || $frame.abs_path || $logentry.formatted || $error.value) && !foobar": [
-              "@common:filter"
+            "($string || $number || $array || $object) && !(debug_meta.** || $frame.filename || $frame.abs_path || $logentry.formatted || $error.value) && !foobar": [
+              "@common:filter",
+              "@ip:replace"
             ],
             "$http.env.REMOTE_ADDR || $user.ip_address || $sdk.client_ip": [
               "@anything:remove"
+            ],
+            "*.cookies.sentrysid || *.cookies.sudo || *.cookies.su || *.cookies.session || *.cookies.__session || *.cookies.sessionid || *.cookies.user_session || *.cookies.symfony || *.cookies.phpsessid || *.cookies.fasthttpsessionid || *.cookies.mysession || *.cookies.irissessionid || *.cookies.csrf || *.cookies.xsrf || *.cookies._xsrf || *.cookies._csrf || *.cookies.csrf-token || *.cookies.csrf_token || *.cookies.xsrf-token || *.cookies.xsrf_token || *.cookies.fastcsrf || *.cookies._iris_csrf": [
+              "@anything:filter"
             ]
           }
         }
@@ -313,11 +417,10 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
 
         insta::assert_json_snapshot!(pii_config, @r###"
         {
-          "rules": {},
-          "vars": {
-            "hashKey": null
-          },
           "applications": {
+            "($string || $number || $array || $object) && !(debug_meta.** || $frame.filename || $frame.abs_path || $logentry.formatted || $error.value)": [
+              "@ip:replace"
+            ],
             "$http.env.REMOTE_ADDR || $user.ip_address || $sdk.client_ip": [
               "@anything:remove"
             ]
@@ -333,7 +436,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
                 "stacktrace": {
                     "frames": [
                     {
-                        "vars": SENSITIVE_VARS.clone()
+                        "vars": sensitive_vars()
                     }
                     ]
                 }
@@ -342,8 +445,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -353,18 +455,38 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         let mut data = Event::from_value(
             serde_json::json!({
                 "request": {
-                    "data": SENSITIVE_VARS.clone(),
-                    "env": SENSITIVE_VARS.clone(),
-                    "headers": SENSITIVE_VARS.clone(),
-                    "cookies": SENSITIVE_VARS.clone()
-                }
+                    "data": sensitive_vars(),
+                    "env": sensitive_vars(),
+                    "headers": sensitive_vars(),
+                    "cookies": sensitive_vars()
+                },
             })
             .into(),
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
+        process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
+        assert_annotated_snapshot!(data);
+    }
+
+    #[test]
+    fn test_sensitive_cookies() {
+        let mut data = Event::from_value(
+            serde_json::json!({
+                "request": {
+                    "cookies": sensitive_cookies()
+                },
+                "contexts": {
+                    "response": {
+                        "cookies": sensitive_cookies(),
+                    }
+                }
+            })
+            .into(),
+        );
+        let pii_config = simple_enabled_pii_config();
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -383,26 +505,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
-        process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
-        assert_annotated_snapshot!(data);
-    }
-
-    #[test]
-    fn test_sdk_client_ip_stripped() {
-        let mut data = Event::from_value(
-            serde_json::json!({
-                "sdk": {
-                    "client_ip": "127.0.0.1"
-                }
-            })
-            .into(),
-        );
-
-        let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -414,27 +517,42 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
                 "user": {
                     "username": "secret",
                     "ip_address": "73.133.27.120",
-                    "data": SENSITIVE_VARS.clone()
+                    "data": sensitive_vars()
                 }
             })
             .into(),
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
 
+    /// Checks that any fields containing an IP-address is scrubbed.
+    /// Even if it doesn't make sense for there to be an IP-address
+    /// such as in the username field.
     #[test]
-    fn test_user_ip_stripped() {
+    fn test_ip_stripped() {
         let mut data = Event::from_value(
             serde_json::json!({
                 "user": {
-                    "username": "secret",
-                    "ip_address": "73.133.27.120",
-                    "data": SENSITIVE_VARS.clone()
+                    "username": "73.133.27.120", // should be stripped despite not being "known ip field"
+                    "ip_address": "should be stripped despite lacking ip address",
+                    "data": sensitive_vars()
+                },
+                "breadcrumbs": {
+                    "values": [
+                        {
+                            "message": "73.133.27.120",
+                            "data": {
+                                "test_data": "73.133.27.120" // test deep wildcard stripping
+                                }
+                        },
+                    ],
+                },
+                "sdk": {
+                    "client_ip": "should also be stripped"
                 }
             })
             .into(),
@@ -448,8 +566,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         };
 
         let pii_config = to_pii_config(&scrubbing_config).unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -473,8 +590,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -484,30 +600,29 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         let mut data = Event::from_value(
             serde_json::json!({
                 "contexts": {
-                    "secret": SENSITIVE_VARS.clone(),
-                    "biz": SENSITIVE_VARS.clone(),
+                    "secret": sensitive_vars(),
+                    "biz": sensitive_vars(),
 
                     // all the structured contexts are not properly scrubbed. We introduced quite a
                     // few regressions here when porting old datascrubbers to rust, but that's fine
                     // because we saw in real data that nobody tried to scrub contexts in the first
                     // place. We're just snapshotting this so that we don't randomly change
                     // behavior further.
-                    "device": SENSITIVE_VARS.clone(),
-                    "os": SENSITIVE_VARS.clone(),
-                    "runtime": SENSITIVE_VARS.clone(),
-                    "app": SENSITIVE_VARS.clone(),
-                    "browser": SENSITIVE_VARS.clone(),
-                    "gpu": SENSITIVE_VARS.clone(),
-                    "trace": SENSITIVE_VARS.clone(),
-                    "monitor": SENSITIVE_VARS.clone(),
+                    "device": sensitive_vars(),
+                    "os": sensitive_vars(),
+                    "runtime": sensitive_vars(),
+                    "app": sensitive_vars(),
+                    "browser": sensitive_vars(),
+                    "gpu": sensitive_vars(),
+                    "trace": sensitive_vars(),
+                    "monitor": sensitive_vars(),
                 }
             })
             .into(),
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
 
         // n.b.: This diverges from Python behavior because it would strip a context that is called
@@ -524,8 +639,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         }).into());
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -548,8 +662,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -566,8 +679,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -584,15 +696,14 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
 
     #[test]
     fn test_sanitize_additional_sensitive_fields() {
-        let mut extra = SENSITIVE_VARS.clone();
+        let mut extra = sensitive_vars();
         {
             let map = extra.as_object_mut().unwrap();
             map.insert("fieldy_field".to_owned(), serde_json::json!("value"));
@@ -610,8 +721,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         });
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -628,8 +738,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -647,8 +756,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -665,8 +773,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -683,8 +790,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -701,37 +807,37 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
+    }
+
+    macro_rules! sanitize_credit_card_within_value_test {
+        ($cc:literal) => {{
+            let mut data = Event::from_value(
+                serde_json::json!({
+                    "extra": {
+                        "foo": $cc
+                    }
+                })
+                .into(),
+            );
+
+            let pii_config = simple_enabled_pii_config();
+                let mut pii_processor = PiiProcessor::new(pii_config.compiled());
+            process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
+            assert_annotated_snapshot!(data);
+        }}
     }
 
     #[test]
     fn test_sanitize_credit_card_within_value_1() {
-        sanitize_credit_card_within_value_test("'4571234567890111'");
+        sanitize_credit_card_within_value_test!("'4571234567890111'");
     }
 
     #[test]
     fn test_sanitize_credit_card_within_value_2() {
-        sanitize_credit_card_within_value_test("foo 4571234567890111");
-    }
-
-    fn sanitize_credit_card_within_value_test(cc: &str) {
-        let mut data = Event::from_value(
-            serde_json::json!({
-                "extra": {
-                    "foo": cc
-                }
-            })
-            .into(),
-        );
-
-        let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
-        process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
-        assert_annotated_snapshot!(data);
+        sanitize_credit_card_within_value_test!("foo 4571234567890111");
     }
 
     #[test]
@@ -746,8 +852,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data, @r###"
         {
@@ -758,29 +863,47 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         "###);
     }
 
+    macro_rules! sanitize_url_test {
+        ($url:literal) => {{
+            let mut data = Event::from_value(
+                serde_json::json!({
+                    "extra": {
+                        "foo": $url
+                    }
+                })
+                .into(),
+            );
+
+            let pii_config = simple_enabled_pii_config();
+                let mut pii_processor = PiiProcessor::new(pii_config.compiled());
+            process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
+            assert_annotated_snapshot!(data);
+        }}
+    }
+
     #[test]
     fn test_sanitize_url_1() {
-        sanitize_url_test("pg://matt:pass@localhost/1");
+        sanitize_url_test!("pg://matt:pass@localhost/1");
     }
 
     #[test]
     fn test_sanitize_url_2() {
-        sanitize_url_test("foo 'redis://redis:foo@localhost:6379/0' bar");
+        sanitize_url_test!("foo 'redis://redis:foo@localhost:6379/0' bar");
     }
 
     #[test]
     fn test_sanitize_url_3() {
-        sanitize_url_test("'redis://redis:foo@localhost:6379/0'");
+        sanitize_url_test!("'redis://redis:foo@localhost:6379/0'");
     }
 
     #[test]
     fn test_sanitize_url_4() {
-        sanitize_url_test("foo redis://redis:foo@localhost:6379/0 bar");
+        sanitize_url_test!("foo redis://redis:foo@localhost:6379/0 bar");
     }
 
     #[test]
     fn test_sanitize_url_5() {
-        sanitize_url_test("foo redis://redis:foo@localhost:6379/0 bar pg://matt:foo@localhost/1");
+        sanitize_url_test!("foo redis://redis:foo@localhost:6379/0 bar pg://matt:foo@localhost/1");
     }
 
     #[test]
@@ -788,40 +911,21 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         // Make sure we don't mess up any other url.
         // This url specifically if passed through urlunsplit(urlsplit()),
         // it'll change the value.
-        sanitize_url_test("postgres:///path");
+        sanitize_url_test!("postgres:///path");
     }
 
     #[test]
     fn test_sanitize_url_7() {
         // Don't be too overly eager within JSON strings an catch the right field.
-        sanitize_url_test(
-            r#"{"a":"https://localhost","b":"foo@localhost","c":"pg://matt:pass@localhost/1","d":"lol"}"#,
+        sanitize_url_test!(
+            r#"{"a":"https://localhost","b":"foo@localhost","c":"pg://matt:pass@localhost/1","d":"lol"}"#
         );
-    }
-
-    fn sanitize_url_test(url: &str) {
-        let mut data = Event::from_value(
-            serde_json::json!({
-                "extra": {
-                    "foo": url
-                }
-            })
-            .into(),
-        );
-
-        let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
-        process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
-        assert_annotated_snapshot!(data);
     }
 
     /// Ensure that valid JSON as request body is parsed as such, and that the PII stripping is
     /// then more granular/sophisticated because we now understand the structure.
     #[test]
     fn test_sanitize_http_body() {
-        use crate::store::{StoreConfig, StoreProcessor};
-
         let mut data = Event::from_value(
             serde_json::json!({
                 "request": {
@@ -837,8 +941,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         process_value(&mut data, &mut store_processor, ProcessingState::root()).unwrap();
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data.value().unwrap().request);
     }
@@ -847,8 +950,6 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
     /// nevertheless.
     #[test]
     fn test_sanitize_http_body_string() {
-        use crate::store::{StoreConfig, StoreProcessor};
-
         let mut data = Event::from_value(
             serde_json::json!({
                 "request": {
@@ -864,8 +965,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         process_value(&mut data, &mut store_processor, ProcessingState::root()).unwrap();
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data.value().unwrap().request);
     }
@@ -882,8 +982,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
 
         assert_annotated_snapshot!(data, @r###"
@@ -907,8 +1006,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -925,8 +1023,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -943,8 +1040,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -961,8 +1057,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -979,8 +1074,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -995,8 +1089,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -1016,8 +1109,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         });
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -1037,8 +1129,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         });
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -1058,8 +1149,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         });
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
 
         assert_annotated_snapshot!(data, @r###"
@@ -1087,8 +1177,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         });
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
 
         assert_annotated_snapshot!(data, @r###"
@@ -1100,36 +1189,37 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         "###);
     }
 
+    macro_rules! should_have_mysql_pwd_as_a_default_test {
+        ($key:literal) => {{
+            let mut data = Event::from_value(
+                serde_json::json!({
+                    "extra": {
+                        *$key: "the one",
+                    }
+                })
+                .into(),
+            );
+
+            let pii_config = to_pii_config(&DataScrubbingConfig {
+                sensitive_fields: vec!["".to_owned()],
+                ..simple_enabled_config()
+            });
+
+            let pii_config = pii_config.unwrap();
+                let mut pii_processor = PiiProcessor::new(pii_config.compiled());
+            process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
+            assert_annotated_snapshot!(data);
+        }}
+    }
+
     #[test]
     fn test_should_have_mysql_pwd_as_a_default_1() {
-        should_have_mysql_pwd_as_a_default_test("MYSQL_PWD");
+        should_have_mysql_pwd_as_a_default_test!("MYSQL_PWD");
     }
 
     #[test]
     fn test_should_have_mysql_pwd_as_a_default_2() {
-        should_have_mysql_pwd_as_a_default_test("mysql_pwd");
-    }
-
-    fn should_have_mysql_pwd_as_a_default_test(key: &str) {
-        let mut data = Event::from_value(
-            serde_json::json!({
-                "extra": {
-                    *key: "the one",
-                }
-            })
-            .into(),
-        );
-
-        let pii_config = to_pii_config(&DataScrubbingConfig {
-            sensitive_fields: vec!["".to_owned()],
-            ..simple_enabled_config()
-        });
-
-        let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
-        process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
-        assert_annotated_snapshot!(data);
+        should_have_mysql_pwd_as_a_default_test!("mysql_pwd");
     }
 
     #[test]
@@ -1151,8 +1241,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         });
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -1184,8 +1273,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         });
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -1200,8 +1288,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         );
 
         let pii_config = simple_enabled_pii_config();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -1238,24 +1325,24 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
               }
             }
           },
-          "vars": {
-            "hashKey": null
-          },
           "applications": {
-            "($string || $number || $array) && !(debug_meta.** || $frame.filename || $frame.abs_path || $logentry.formatted || $error.value)": [
+            "($string || $number || $array || $object) && !(debug_meta.** || $frame.filename || $frame.abs_path || $logentry.formatted || $error.value)": [
               "@common:filter",
+              "@ip:replace",
               "strip-fields"
             ],
             "$http.env.REMOTE_ADDR || $user.ip_address || $sdk.client_ip": [
               "@anything:remove"
+            ],
+            "*.cookies.sentrysid || *.cookies.sudo || *.cookies.su || *.cookies.session || *.cookies.__session || *.cookies.sessionid || *.cookies.user_session || *.cookies.symfony || *.cookies.phpsessid || *.cookies.fasthttpsessionid || *.cookies.mysession || *.cookies.irissessionid || *.cookies.csrf || *.cookies.xsrf || *.cookies._xsrf || *.cookies._csrf || *.cookies.csrf-token || *.cookies.csrf_token || *.cookies.xsrf-token || *.cookies.xsrf_token || *.cookies.fastcsrf || *.cookies._iris_csrf": [
+              "@anything:filter"
             ]
           }
         }
         "###);
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -1277,8 +1364,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         });
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -1306,8 +1392,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         });
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -1334,8 +1419,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         });
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -1362,8 +1446,7 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
         });
 
         let pii_config = pii_config.unwrap();
-        let compiled = pii_config.compiled();
-        let mut pii_processor = PiiProcessor::new(&compiled);
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
         process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
         assert_annotated_snapshot!(data);
     }
@@ -1385,5 +1468,97 @@ THd+9FBxiHLGXNKhG/FRSyREXEt+NyYIf/0cyByc9tNksat794ddUqnLOg0vwSkv
 
         let pii_config = pii_config.unwrap();
         insta::assert_json_snapshot!(pii_config);
+    }
+
+    #[test]
+    fn test_safe_fields_for_token() {
+        let mut data = Event::from_value(
+            serde_json::json!({
+                "extra": {
+                    "password": "foo",
+                    "github_token": "bar",
+                    "access_token": "quz",
+                    "stripetoken": "baz",
+                    "my-token": "secret",
+                    "new_token": "hidden",
+                    "secret-token-here": "ops"
+                }
+            })
+            .into(),
+        );
+        let pii_config = to_pii_config(&DataScrubbingConfig {
+            sensitive_fields: vec![],
+            exclude_fields: vec![
+                "GITHUB_TOKEN".to_owned(),
+                "access_token".to_owned(),
+                "stripetoken".to_owned(),
+            ],
+            ..simple_enabled_config()
+        });
+
+        let pii_config = pii_config.unwrap();
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
+        process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
+        assert_annotated_snapshot!(data);
+    }
+
+    #[test]
+    fn test_scrub_object() {
+        let mut data = Event::from_value(
+            serde_json::json!({
+                "request": {
+                    "url": "https://www.example.com/fr/testing/authenticate",
+                    "method": "POST",
+                    "data": {
+                      "password": "test",
+                      "profile": {
+                        "email": "testing@example.com",
+                        "password": {
+                          "$eq": "u{}{}{}]H[[[]]ww6KrA9F.x-F%%"
+                        }
+                      },
+                      "submit": "Se connecter"
+                    }
+                }
+            })
+            .into(),
+        );
+
+        let config = simple_enabled_pii_config();
+        let mut pii_processor = PiiProcessor::new(config.compiled());
+        process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
+        assert_annotated_snapshot!(data);
+    }
+
+    #[test]
+    fn test_no_scrub_object_with_safe_fields() {
+        let mut data = Event::from_value(
+            serde_json::json!({
+                "request": {
+                    "url": "https://www.example.com/fr/testing/authenticate",
+                    "method": "POST",
+                    "data": {
+                      "password": "test",
+                      "credentials": {
+                        "email": "testing@example.com",
+                        "password": "test",
+                      },
+                      "submit": "Se connecter"
+                    }
+                }
+            })
+            .into(),
+        );
+
+        let pii_config = to_pii_config(&DataScrubbingConfig {
+            sensitive_fields: vec![],
+            exclude_fields: vec!["credentials".to_owned()],
+            ..simple_enabled_config()
+        })
+        .unwrap();
+
+        let mut pii_processor = PiiProcessor::new(pii_config.compiled());
+        process_value(&mut data, &mut pii_processor, ProcessingState::root()).unwrap();
+        assert_annotated_snapshot!(data);
     }
 }

@@ -2,18 +2,411 @@
 
 ## Unreleased
 
+**Features**:
+
+- Use different error message for empty strings in schema processing. ([#2151](https://github.com/getsentry/relay/pull/2151))
+
+## 23.5.1
+
+**Bug Fixes**:
+
+- Sample only transaction events instead of sampling both transactions and errors. ([#2130](https://github.com/getsentry/relay/pull/2130))
+- Fix tagging of incoming errors with `sampled` that was not done due to lack of sampling state. ([#2148](https://github.com/getsentry/relay/pull/2148))
+- Remove profiling feature flag. ([#2146](https://github.com/getsentry/relay/pull/2146))
+
+**Internal**:
+
+- Mark all URL transactions as `sanitized` when `txNameReady` flag is set. ([#2128](https://github.com/getsentry/relay/pull/2128), [#2139](https://github.com/getsentry/relay/pull/2139))
+- Tag incoming errors with the new `sampled` field in case their DSC is sampled. ([#2026](https://github.com/getsentry/relay/pull/2026))
+- Enable PII scrubbing for urls field ([#2143](https://github.com/getsentry/relay/pull/2143))
+
+## 23.5.0
+
+**Bug Fixes**:
+
+- Enforce rate limits for monitor check-ins. ([#2065](https://github.com/getsentry/relay/pull/2065))
+- Allow rate limits greater than `u32::MAX`. ([#2079](https://github.com/getsentry/relay/pull/2079))
+- Do not drop envelope when client closes connection. ([#2089](https://github.com/getsentry/relay/pull/2089))
+
+**Features**:
+
+- Scrub IBAN as pii. ([#2117](https://github.com/getsentry/relay/pull/2117))
+- Scrub sensitive keys (`passwd`, `token`, ...) in Replay recording data. ([#2034](https://github.com/getsentry/relay/pull/2034))
+- Add support for old 'violated-directive' CSP format. ([#2048](https://github.com/getsentry/relay/pull/2048))
+- Add document_uri to csp filter. ([#2059](https://github.com/getsentry/relay/pull/2059))
+- Store `geo.subdivision` of the end user location. ([#2058](https://github.com/getsentry/relay/pull/2058))
+- Scrub URLs in span descriptions. ([#2095](https://github.com/getsentry/relay/pull/2095))
+
+**Internal**:
+
+- Remove transaction metrics allowlist. ([#2092](https://github.com/getsentry/relay/pull/2092))
+- Include unknown feature flags in project config when serializing it. ([#2040](https://github.com/getsentry/relay/pull/2040))
+- Copy transaction tags to the profile. ([#1982](https://github.com/getsentry/relay/pull/1982))
+- Lower default max compressed replay recording segment size to 10 MiB. ([#2031](https://github.com/getsentry/relay/pull/2031))
+- Increase chunking limit to 15MB for replay recordings. ([#2032](https://github.com/getsentry/relay/pull/2032))
+- Add a data category for indexed profiles. ([#2051](https://github.com/getsentry/relay/pull/2051), [#2071](https://github.com/getsentry/relay/pull/2071))
+- Differentiate between `Profile` and `ProfileIndexed` outcomes. ([#2054](https://github.com/getsentry/relay/pull/2054))
+- Split dynamic sampling implementation before refactoring. ([#2047](https://github.com/getsentry/relay/pull/2047))
+- Refactor dynamic sampling implementation across `relay-server` and `relay-sampling`. ([#2066](https://github.com/getsentry/relay/pull/2066))
+- Adds support for `replay_id` field for the `DynamicSamplingContext`'s `FieldValueProvider`. ([#2070](https://github.com/getsentry/relay/pull/2070))
+- On Linux, switch to `jemalloc` instead of the system memory allocator to reduce Relay's memory footprint. ([#2084](https://github.com/getsentry/relay/pull/2084))
+- Scrub sensitive cookies `__session`. ([#2105](https://github.com/getsentry/relay/pull/2105)))
+- Parse profiles' metadata to check if it should be marked as invalid. ([#2104](https://github.com/getsentry/relay/pull/2104))
+- Set release as optional by defaulting to an empty string and add a dist field for profiles. ([#2098](https://github.com/getsentry/relay/pull/2098), [#2107](https://github.com/getsentry/relay/pull/2107))
+- Accept source map debug images in debug meta for Profiling. ([#2097](https://github.com/getsentry/relay/pull/2097))
+
+## 23.4.0
+
+**Breaking Changes**:
+
+This release contains major changes to the web layer, including TCP and HTTP handling as well as all web endpoint handlers. Due to these changes, some functionality was retired and Relay responds differently in specific cases.
+
+Configuration:
+
+- SSL support has been dropped. As per [official guidelines](https://docs.sentry.io/product/relay/operating-guidelines/), Relay should be operated behind a reverse proxy, which can perform SSL termination.
+- Connection config options `max_connections`, `max_pending_connections`, and `max_connection_rate` no longer have an effect. Instead, configure the reverse proxy to handle connection concurrency as needed.
+
+Endpoints:
+
+- The security endpoint no longer forwards to upstream if the mime type doesn't match supported mime types. Instead, the request is rejected with a corresponding error.
+- Passing store payloads as `?sentry_data=<base64>` query parameter is restricted to `GET` requests on the store endpoint. Other endpoints require the payload to be passed in the request body.
+- Requests with an invalid `content-encoding` header will now be rejected. Exceptions to this are an empty string and `UTF-8`, which have been sent historically by some SDKs and are now treated as identity (no encoding). Previously, all unknown encodings were treated as identity.
+- Temporarily, response bodies for some errors are rendered as plain text instead of JSON. This will be addressed in an upcoming release.
+
+Metrics:
+
+- The `route` tag of request metrics uses the route pattern instead of schematic names. There is an exact replacement for every previous route. For example, `"store-default"` is now tagged as `"/api/:project_id/store/"`.
+- Statsd metrics `event.size_bytes.raw` and `event.size_bytes.uncompressed` have been removed.
+
+**Features**:
+
+- Allow monitor checkins to paass `monitor_config` for monitor upserts. ([#1962](https://github.com/getsentry/relay/pull/1962))
+- Add replay_id onto event from dynamic sampling context. ([#1983](https://github.com/getsentry/relay/pull/1983))
+- Add product-name for devices, derived from the android model. ([#2004](https://github.com/getsentry/relay/pull/2004))
+- Changes how device class is determined for iPhone devices. Instead of checking processor frequency, the device model is mapped to a device class. ([#1970](https://github.com/getsentry/relay/pull/1970))
+- Don't sanitize transactions if no clustering rules exist and no UUIDs were scrubbed. ([#1976](https://github.com/getsentry/relay/pull/1976))
+- Add `thread.lock_mechanism` field to protocol. ([#1979](https://github.com/getsentry/relay/pull/1979))
+- Add `origin` to trace context and span. ([#1984](https://github.com/getsentry/relay/pull/1984))
+- Add `jvm` debug file type. ([#2002](https://github.com/getsentry/relay/pull/2002))
+- Add new `mechanism` fields to protocol to support exception groups. ([#2020](https://github.com/getsentry/relay/pull/2020))
+- Change `lock_reason` attribute to a `held_locks` dictionary in the `thread` interface. ([#2018](https://github.com/getsentry/relay/pull/2018))
+
+**Internal**:
+
+- Add BufferService with SQLite backend. ([#1920](https://github.com/getsentry/relay/pull/1920))
+- Upgrade the web framework and related dependencies. ([#1938](https://github.com/getsentry/relay/pull/1938))
+- Apply transaction clustering rules before UUID scrubbing rules. ([#1964](https://github.com/getsentry/relay/pull/1964))
+- Use exposed device-class-synthesis feature flag to gate device.class synthesis in light normalization. ([#1974](https://github.com/getsentry/relay/pull/1974))
+- Adds iPad support for device.class synthesis in light normalization. ([#2008](https://github.com/getsentry/relay/pull/2008))
+- Pin schemars dependency to un-break schema docs generation. ([#2014](https://github.com/getsentry/relay/pull/2014))
+- Remove global service registry. ([#2022](https://github.com/getsentry/relay/pull/2022))
+- Apply schema validation to all topics in local development. ([#2013](https://github.com/getsentry/relay/pull/2013))
+
+Monitors:
+
+- Monitor check-ins may now specify an environment ([#2027](https://github.com/getsentry/relay/pull/2027))
+
+## 23.3.1
+
+**Features**:
+
+- Indicate if OS-version may be frozen with '>=' prefix. ([#1945](https://github.com/getsentry/relay/pull/1945))
+- Normalize monitor slug parameters into slugs. ([#1913](https://github.com/getsentry/relay/pull/1913))
+- Smart trim loggers for Java platforms. ([#1941](https://github.com/getsentry/relay/pull/1941))
+
+**Internal**:
+
+- PII scrub `span.data` by default. ([#1953](https://github.com/getsentry/relay/pull/1953))
+- Scrub sensitive cookies. ([#1951](https://github.com/getsentry/relay/pull/1951)))
+
+## 23.3.0
+
+**Features**:
+
+- Extract attachments from transaction events and send them to kafka individually. ([#1844](https://github.com/getsentry/relay/pull/1844))
+- Protocol validation for source map image type. ([#1869](https://github.com/getsentry/relay/pull/1869))
+- Strip quotes from client hint values. ([#1874](https://github.com/getsentry/relay/pull/1874))
+- Add Dotnet, Javascript and PHP support for profiling. ([#1871](https://github.com/getsentry/relay/pull/1871), [#1876](https://github.com/getsentry/relay/pull/1876), [#1885](https://github.com/getsentry/relay/pull/1885))
+- Initial support for the Crons beta. ([#1886](https://github.com/getsentry/relay/pull/1886))
+- Scrub `span.data.http.query` with default scrubbers. ([#1889](https://github.com/getsentry/relay/pull/1889))
+- Synthesize new class attribute in device context using specs found on the device, such as processor_count, memory_size, etc. ([#1895](https://github.com/getsentry/relay/pull/1895))
+- Add `thread.state` field to protocol. ([#1896](https://github.com/getsentry/relay/pull/1896))
+- Move device.class from contexts to tags. ([#1911](https://github.com/getsentry/relay/pull/1911))
+- Optionally mark scrubbed URL transactions as sanitized. ([#1917](https://github.com/getsentry/relay/pull/1917))
+- Perform PII scrubbing on meta's original_value field. ([#1892](https://github.com/getsentry/relay/pull/1892))
+- Add links to docs in YAML config file. ([#1923](https://github.com/getsentry/relay/pull/1923))
+- For security reports, add the request's `origin` header to sentry events. ([#1934](https://github.com/getsentry/relay/pull/1934))
+
+**Bug Fixes**:
+
+- Enforce rate limits for session replays. ([#1877](https://github.com/getsentry/relay/pull/1877))
+
+**Internal**:
+
+- Revert back the addition of metric names as tag on Sentry errors when relay drops metrics. ([#1873](https://github.com/getsentry/relay/pull/1873))
+- Tag the dynamic sampling decision on `count_per_root_project` to measure effective sample rates. ([#1870](https://github.com/getsentry/relay/pull/1870))
+- Deprecate fields on the profiling sample format. ([#1878](https://github.com/getsentry/relay/pull/1878))
+- Remove idle samples at the start and end of a profile and useless metadata. ([#1894](https://github.com/getsentry/relay/pull/1894))
+- Move the pending envelopes buffering into the project cache. ([#1907](https://github.com/getsentry/relay/pull/1907))
+- Remove platform validation for profiles. ([#1933](https://github.com/getsentry/relay/pull/1933))
+
+## 23.2.0
+
+**Features**:
+
+- Use client hint headers instead of User-Agent when available. ([#1752](https://github.com/getsentry/relay/pull/1752), [#1802](https://github.com/getsentry/relay/pull/1802), [#1838](https://github.com/getsentry/relay/pull/1838))
+- Apply all configured data scrubbing rules on Replays. ([#1731](https://github.com/getsentry/relay/pull/1731))
+- Add count transactions toward root project. ([#1734](https://github.com/getsentry/relay/pull/1734))
+- Add or remove the profile ID on the transaction's profiling context. ([#1801](https://github.com/getsentry/relay/pull/1801))
+- Implement a new sampling algorithm with factors and multi-matching. ([#1790](https://github.com/getsentry/relay/pull/1790)
+- Add Cloud Resource context. ([#1854](https://github.com/getsentry/relay/pull/1854))
+
+**Bug Fixes**:
+
+- Fix a bug where the replays ip-address normalization was not being applied when the user object was omitted. ([#1805](https://github.com/getsentry/relay/pull/1805))
+- Improve performance for replays, especially memory usage during data scrubbing. ([#1800](https://github.com/getsentry/relay/pull/1800), [#1825](https://github.com/getsentry/relay/pull/1825))
+- When a transaction is rate limited, also remove associated profiles. ([#1843](https://github.com/getsentry/relay/pull/1843))
+
+**Internal**:
+
+- Add metric name as tag on Sentry errors from relay dropping metrics. ([#1797](https://github.com/getsentry/relay/pull/1797))
+- Make sure to scrub all the fields with PII. If the fields contain an object, the entire object will be removed. ([#1789](https://github.com/getsentry/relay/pull/1789))
+- Keep meta for removed custom measurements. ([#1815](https://github.com/getsentry/relay/pull/1815))
+- Drop replay recording payloads if they cannot be parsed or scrubbed. ([#1683](https://github.com/getsentry/relay/pull/1683))
+
+## 23.1.1
+
+**Features**:
+
+- Add error and sample rate fields to the replay event parser. ([#1745](https://github.com/getsentry/relay/pull/1745))
+- Add `instruction_addr_adjustment` field to `RawStacktrace`. ([#1716](https://github.com/getsentry/relay/pull/1716))
+- Add SSL support to `relay-redis` crate. It is possible to use `rediss` scheme to connnect to Redis cluster using TLS. ([#1772](https://github.com/getsentry/relay/pull/1772))
+
+**Internal**:
+
+- Fix type errors in replay recording parsing. ([#1765](https://github.com/getsentry/relay/pull/1765))
+- Remove error and session sample rate fields from replay-event parser. ([#1791](https://github.com/getsentry/relay/pull/1791))
+- Scrub replay recording PII from mutation "texts" vector. ([#1796](https://github.com/getsentry/relay/pull/1796))
+
+## 23.1.0
+
+**Features**:
+
+- Add support for `limits.keepalive_timeout` configuration. ([#1645](https://github.com/getsentry/relay/pull/1645))
+- Add support for decaying functions in dynamic sampling rules. ([#1692](https://github.com/getsentry/relay/pull/1692))
+- Stop extracting duration metric for session payloads. ([#1739](https://github.com/getsentry/relay/pull/1739))
+- Add Profiling Context ([#1748](https://github.com/getsentry/relay/pull/1748))
+
+**Internal**:
+
+- Remove concurrent profiling. ([#1697](https://github.com/getsentry/relay/pull/1697))
+- Use the main Sentry SDK to submit crash reports instead of a custom curl-based backend. This removes a dependency on `libcurl` and ensures compliance with latest TLS standards for crash uploads. Note that this only affects Relay if the hidden `_crash_db` option is used. ([#1707](https://github.com/getsentry/relay/pull/1707))
+- Support transaction naming rules. ([#1695](https://github.com/getsentry/relay/pull/1695))
+- Add PII scrubbing to URLs captured by replay recordings ([#1730](https://github.com/getsentry/relay/pull/1730))
+- Add more measurement units for profiling. ([#1732](https://github.com/getsentry/relay/pull/1732))
+- Add backoff mechanism for fetching projects from the project cache. ([#1726](https://github.com/getsentry/relay/pull/1726))
+
+## 22.12.0
+
+**Features**:
+
+- The level of events created from Unreal Crash Reports now depends on whether it was an actual crash or an assert. ([#1677](https://github.com/getsentry/relay/pull/1677))
+- Dynamic sampling is now based on the volume received by Relay by default and does not include the original volume dropped by client-side sampling in SDKs. This is required for the final dynamic sampling feature in the latest Sentry plans. ([#1591](https://github.com/getsentry/relay/pull/1591))
+- Add OpenTelemetry Context. ([#1617](https://github.com/getsentry/relay/pull/1617))
+- Add `app.in_foreground` and `thread.main` flag to protocol. ([#1578](https://github.com/getsentry/relay/pull/1578))
+- Add support for View Hierarchy attachment_type. ([#1642](https://github.com/getsentry/relay/pull/1642))
+- Add invalid replay recording outcome. ([#1684](https://github.com/getsentry/relay/pull/1684))
+- Stop rejecting spans without a timestamp, instead giving them their respective event timestamp and setting their status to DeadlineExceeded. ([#1690](https://github.com/getsentry/relay/pull/1690))
+- Add max replay size configuration parameter. ([#1694](https://github.com/getsentry/relay/pull/1694))
+- Add nonchunked replay recording message type. ([#1653](https://github.com/getsentry/relay/pull/1653))
+- Add `abnormal_mechanism` field to SessionUpdate protocol. ([#1665](https://github.com/getsentry/relay/pull/1665))
+- Add replay-event normalization and PII scrubbing. ([#1582](https://github.com/getsentry/relay/pull/1582))
+- Scrub all fields with IP addresses rather than only known IP address fields. ([#1725](https://github.com/getsentry/relay/pull/1725))
+
+**Bug Fixes**:
+
+- Make `attachment_type` on envelope items forward compatible by adding fallback variant. ([#1638](https://github.com/getsentry/relay/pull/1638))
+- Relay no longer accepts transaction events older than 5 days. Previously the event was accepted and stored, but since metrics for such old transactions are not supported it did not show up in parts of Sentry such as the Performance landing page. ([#1663](https://github.com/getsentry/relay/pull/1663))
+- Apply dynamic sampling to transactions from older SDKs and even in case Relay cannot load project information. This avoids accidentally storing 100% of transactions. ([#1667](https://github.com/getsentry/relay/pull/1667))
+- Replay recording parser now uses the entire body rather than a subset. ([#1682](https://github.com/getsentry/relay/pull/1682))
+- Fix a potential OOM in the Replay recording parser. ([#1691](https://github.com/getsentry/relay/pull/1691))
+- Fix type error in replay recording parser. ([#1702](https://github.com/getsentry/relay/pull/1702))
+
+**Internal**:
+
+- Emit a `service.back_pressure` metric that measures internal back pressure by service. ([#1583](https://github.com/getsentry/relay/pull/1583))
+- Track metrics for OpenTelemetry events. ([#1618](https://github.com/getsentry/relay/pull/1618))
+- Normalize transaction name for URLs transaction source, by replacing UUIDs, SHAs and numerical IDs in transaction names by placeholders. ([#1621](https://github.com/getsentry/relay/pull/1621))
+- Parse string as number to handle a release bug. ([#1637](https://github.com/getsentry/relay/pull/1637))
+- Expand Profiling's discard reasons. ([#1661](https://github.com/getsentry/relay/pull/1661), [#1685](https://github.com/getsentry/relay/pull/1685))
+- Allow to rate limit profiles on top of transactions. ([#1681](https://github.com/getsentry/relay/pull/1681))
+
+## 22.11.0
+
+**Features**:
+
+- Add PII scrubber for replay recordings. ([#1545](https://github.com/getsentry/relay/pull/1545))
+- Support decaying rules. Decaying rules are regular sampling rules, but they are only applicable in a specific time range. ([#1544](https://github.com/getsentry/relay/pull/1544))
+- Disallow `-` in measurement and breakdown names. These items are converted to metrics, which do not allow `-` in their name. ([#1571](https://github.com/getsentry/relay/pull/1571))
+
+**Bug Fixes**:
+
+- Validate the distribution name in the event. ([#1556](https://github.com/getsentry/relay/pull/1556))
+- Use correct meta object for logentry in light normalization. ([#1577](https://github.com/getsentry/relay/pull/1577))
+
+**Internal**:
+
+- Implement response context schema. ([#1529](https://github.com/getsentry/relay/pull/1529))
+- Support dedicated quotas for storing transaction payloads ("indexed transactions") via the `transaction_indexed` data category if metrics extraction is enabled. ([#1537](https://github.com/getsentry/relay/pull/1537), [#1555](https://github.com/getsentry/relay/pull/1555))
+- Report outcomes for dynamic sampling with the correct indexed transaction data category to restore correct totals. ([#1561](https://github.com/getsentry/relay/pull/1561))
+- Add fields to the Frame object for the sample format. ([#1562](https://github.com/getsentry/relay/pull/1562))
+- Move kafka related code into separate `relay-kafka` crate. ([#1563](https://github.com/getsentry/relay/pull/1563))
+
+## 22.10.0
+
+**Features**:
+
+- Limit the number of custom measurements per event. ([#1483](https://github.com/getsentry/relay/pull/1483)))
+- Add INP web vital as a measurement. ([#1487](https://github.com/getsentry/relay/pull/1487))
+- Add .NET/Portable-PDB specific protocol fields. ([#1518](https://github.com/getsentry/relay/pull/1518))
+- Enforce rate limits on metrics buckets using the transactions_processed quota. ([#1515](https://github.com/getsentry/relay/pull/1515))
+- PII scrubbing now treats any key containing `token` as a password. ([#1527](https://github.com/getsentry/relay/pull/1527))
+
+**Bug Fixes**:
+
+- Make sure that non-processing Relays drop all invalid transactions. ([#1513](https://github.com/getsentry/relay/pull/1513))
+
+**Internal**:
+
+- Introduce a new profile format called `sample`. ([#1462](https://github.com/getsentry/relay/pull/1462))
+- Generate a new profile ID when splitting a profile for multiple transactions. ([#1473](https://github.com/getsentry/relay/pull/1473))
+- Pin Rust version to 1.63.0 in Dockerfile. ([#1482](https://github.com/getsentry/relay/pull/1482))
+- Normalize measurement units in event payload. ([#1488](https://github.com/getsentry/relay/pull/1488))
+- Remove long-running futures from metrics flush. ([#1492](https://github.com/getsentry/relay/pull/1492))
+- Migrate to 2021 Rust edition. ([#1510](https://github.com/getsentry/relay/pull/1510))
+- Make the profiling frame object compatible with the stacktrace frame object from event. ([#1512](https://github.com/getsentry/relay/pull/1512))
+- Fix quota DataCategory::TransactionProcessed serialisation to match that of the CAPI. ([#1514](https://github.com/getsentry/relay/pull/1514))
+- Support checking quotas in the Redis rate limiter without incrementing them. ([#1519](https://github.com/getsentry/relay/pull/1519))
+- Update the internal service architecture for metrics aggregator service. ([#1508](https://github.com/getsentry/relay/pull/1508))
+- Add data category for indexed transactions. This will come to represent stored transactions, while the existing category will represent transaction metrics. ([#1535](https://github.com/getsentry/relay/pull/1535))
+- Adjust replay parser to be less strict and allow for larger segment-ids. ([#1551](https://github.com/getsentry/relay/pull/1551))
+
+## 22.9.0
+
+**Features**:
+
+- Add user-agent parsing to Replays. ([#1420](https://github.com/getsentry/relay/pull/1420))
+- Improve the release name used when reporting data to Sentry to include both the version and exact build. ([#1428](https://github.com/getsentry/relay/pull/1428))
+
+**Bug Fixes**:
+
+- Do not apply rate limits or reject data based on expired project configs. ([#1404](https://github.com/getsentry/relay/pull/1404))
+- Process required stacktraces to fix filtering events originating from browser extensions. ([#1423](https://github.com/getsentry/relay/pull/1423))
+- Fix error message filtering when formatting the message of logentry. ([#1442](https://github.com/getsentry/relay/pull/1442))
+- Loosen type requirements for the `user.id` field in Replays. ([#1443](https://github.com/getsentry/relay/pull/1443))
+- Fix panic in datascrubbing when number of sensitive fields was too large. ([#1474](https://github.com/getsentry/relay/pull/1474))
+
+**Internal**:
+
+- Make the Redis connection pool configurable. ([#1418](https://github.com/getsentry/relay/pull/1418))
+- Add support for sharding Kafka producers across clusters. ([#1454](https://github.com/getsentry/relay/pull/1454))
+- Speed up project cache eviction through a background thread. ([#1410](https://github.com/getsentry/relay/pull/1410))
+- Batch metrics buckets into logical partitions before sending them as Envelopes. ([#1440](https://github.com/getsentry/relay/pull/1440))
+- Filter single samples in cocoa profiles and events with no duration in Android profiles. ([#1445](https://github.com/getsentry/relay/pull/1445))
+- Add a "invalid_replay" discard reason for invalid replay events. ([#1455](https://github.com/getsentry/relay/pull/1455))
+- Add rate limiters for replays and replay recordings. ([#1456](https://github.com/getsentry/relay/pull/1456))
+- Use the different configuration for billing outcomes when specified. ([#1461](https://github.com/getsentry/relay/pull/1461))
+- Support profiles tagged for many transactions. ([#1444](https://github.com/getsentry/relay/pull/1444), [#1463](https://github.com/getsentry/relay/pull/1463), [#1464](https://github.com/getsentry/relay/pull/1464), [#1465](https://github.com/getsentry/relay/pull/1465))
+- Track metrics for changes to the transaction name and DSC propagations. ([#1466](https://github.com/getsentry/relay/pull/1466))
+- Simplify the ingestion path to reduce endpoint response times. ([#1416](https://github.com/getsentry/relay/issues/1416), [#1429](https://github.com/getsentry/relay/issues/1429), [#1431](https://github.com/getsentry/relay/issues/1431))
+- Update the internal service architecture for the store, outcome, and processor services. ([#1405](https://github.com/getsentry/relay/pull/1405), [#1415](https://github.com/getsentry/relay/issues/1415), [#1421](https://github.com/getsentry/relay/issues/1421), [#1441](https://github.com/getsentry/relay/issues/1441), [#1457](https://github.com/getsentry/relay/issues/1457), [#1470](https://github.com/getsentry/relay/pull/1470))
+
+## 22.8.0
+
+**Features**:
+
+- Remove timeout-based expiry of envelopes in Relay's internal buffers. The `cache.envelope_expiry` is now inactive. To control the size of the envelope buffer, use `cache.envelope_buffer_size` exclusively, instead. ([#1398](https://github.com/getsentry/relay/pull/1398))
+- Parse sample rates as JSON. ([#1353](https://github.com/getsentry/relay/pull/1353))
+- Filter events in external Relays, before extracting metrics. ([#1379](https://github.com/getsentry/relay/pull/1379))
+- Add `privatekey` and `private_key` as secret key name to datascrubbers. ([#1376](https://github.com/getsentry/relay/pull/1376))
+- Explain why we responded with 429. ([#1389](https://github.com/getsentry/relay/pull/1389))
+
+**Bug Fixes**:
+
+- Fix a bug where unreal crash reports were dropped when metrics extraction is enabled. ([#1355](https://github.com/getsentry/relay/pull/1355))
+- Extract user from metrics with EventUser's priority. ([#1363](https://github.com/getsentry/relay/pull/1363))
+- Honor `SentryConfig.enabled` and don't init SDK at all if it is false. ([#1380](https://github.com/getsentry/relay/pull/1380))
+- The priority thread metadata on profiles is now optional, do not fail the profile if it's not present. ([#1392](https://github.com/getsentry/relay/pull/1392))
+
+**Internal**:
+
+- Support compressed project configs in redis cache. ([#1345](https://github.com/getsentry/relay/pull/1345))
+- Refactor profile processing into its own crate. ([#1340](https://github.com/getsentry/relay/pull/1340))
+- Treat "unknown" transaction source as low cardinality for safe SDKs. ([#1352](https://github.com/getsentry/relay/pull/1352), [#1356](https://github.com/getsentry/relay/pull/1356))
+- Conditionally write a default transaction source to the transaction payload. ([#1354](https://github.com/getsentry/relay/pull/1354))
+- Generate mobile measurements frames_frozen_rate, frames_slow_rate, stall_percentage. ([#1373](https://github.com/getsentry/relay/pull/1373))
+- Change to the internals of the healthcheck endpoint. ([#1374](https://github.com/getsentry/relay/pull/1374), [#1377](https://github.com/getsentry/relay/pull/1377))
+- Re-encode the Typescript payload to normalize. ([#1372](https://github.com/getsentry/relay/pull/1372))
+- Partially normalize events before extracting metrics. ([#1366](https://github.com/getsentry/relay/pull/1366))
+- Spawn more threads for CPU intensive work. ([#1378](https://github.com/getsentry/relay/pull/1378))
+- Add missing fields to DeviceContext ([#1383](https://github.com/getsentry/relay/pull/1383))
+- Improve performance of Redis accesses by not running `PING` everytime a connection is reused. ([#1394](https://github.com/getsentry/relay/pull/1394))
+- Distinguish between various discard reasons for profiles. ([#1395](https://github.com/getsentry/relay/pull/1395))
+- Add missing fields to GPUContext ([#1391](https://github.com/getsentry/relay/pull/1391))
+- Store actor now uses Tokio for message handling instead of Actix. ([#1397](https://github.com/getsentry/relay/pull/1397))
+- Add app_memory to AppContext struct. ([#1403](https://github.com/getsentry/relay/pull/1403))
+
+## 22.7.0
+
+**Features**:
+
+- Adjust sample rate by envelope header's sample_rate. ([#1327](https://github.com/getsentry/relay/pull/1327))
+- Support `transaction_info` on event payloads. ([#1330](https://github.com/getsentry/relay/pull/1330))
+- Extract transaction metrics in external relays. ([#1344](https://github.com/getsentry/relay/pull/1344))
+
+**Bug Fixes**:
+
+- Parse custom units with length < 15 without crashing. ([#1312](https://github.com/getsentry/relay/pull/1312))
+- Split large metrics requests into smaller batches. This avoids failed metrics submission and lost Release Health data due to `413 Payload Too Large` errors on the upstream. ([#1326](https://github.com/getsentry/relay/pull/1326))
+- Metrics extraction: Map missing transaction status to "unknown". ([#1333](https://github.com/getsentry/relay/pull/1333))
+- Fix [CVE-2022-2068](https://www.openssl.org/news/vulnerabilities.html#CVE-2022-2068) and [CVE-2022-2097](https://www.openssl.org/news/vulnerabilities.html#CVE-2022-2097) by updating to OpenSSL 1.1.1q. ([#1334](https://github.com/getsentry/relay/pull/1334))
+
+**Internal**:
+
+- Reduce number of metrics extracted for release health. ([#1316](https://github.com/getsentry/relay/pull/1316))
+- Indicate with thread is the main thread in thread metadata for profiles. ([#1320](https://github.com/getsentry/relay/pull/1320))
+- Increase profile maximum size by an order of magnitude. ([#1321](https://github.com/getsentry/relay/pull/1321))
+- Add data category constant for processed transactions, encompassing all transactions that have been received and sent through dynamic sampling as well as metrics extraction. ([#1306](https://github.com/getsentry/relay/pull/1306))
+- Extract metrics also from trace-sampled transactions. ([#1317](https://github.com/getsentry/relay/pull/1317))
+- Extract metrics from a configurable amount of custom transaction measurements. ([#1324](https://github.com/getsentry/relay/pull/1324))
+- Metrics: Drop transaction tag for high-cardinality sources. ([#1339](https://github.com/getsentry/relay/pull/1339))
+
+## 22.6.0
+
 **Compatibility:** This version of Relay requires Sentry server `22.6.0` or newer.
+
+**Features**:
+
+- Relay is now compatible with CentOS 7 and Red Hat Enterprise Linux 7 onward (kernel version _2.6.32_), depending on _glibc 2.17_ or newer. The `crash-handler` feature, which is currently enabled in the build published to DockerHub, additionally requires _curl 7.29_ or newer. ([#1279](https://github.com/getsentry/relay/pull/1279))
+- Optionally start relay with `--upstream-dsn` to pass a Sentry DSN instead of the URL. This can be convenient when starting Relay in environments close to an SDK, where a DSN is already available. ([#1277](https://github.com/getsentry/relay/pull/1277))
+- Add a new runtime mode `--aws-runtime-api=$AWS_LAMBDA_RUNTIME_API` that integrates Relay with the AWS Extensions API lifecycle. ([#1277](https://github.com/getsentry/relay/pull/1277))
+- Add Replay ItemTypes. ([#1236](https://github.com/getsentry/relay/pull/1236), ([#1239](https://github.com/getsentry/relay/pull/1239))
 
 **Bug Fixes**:
 
 - Session metrics extraction: Count distinct_ids from all session updates to prevent undercounting users. ([#1275](https://github.com/getsentry/relay/pull/1275))
-
 - Session metrics extraction: Count crashed+abnormal towards errored_preaggr. ([#1274](https://github.com/getsentry/relay/pull/1274))
 
 **Internal**:
 
 - Add version 3 to the project configs endpoint. This allows returning pending results which need to be polled later and avoids blocking batched requests on single slow entries. ([#1263](https://github.com/getsentry/relay/pull/1263))
 - Emit specific event type tags for "processing.event.produced" metric. ([#1270](https://github.com/getsentry/relay/pull/1270))
+- Add support for profile outcomes. ([#1272](https://github.com/getsentry/relay/pull/1272))
+- Avoid potential panics when scrubbing minidumps. ([#1282](https://github.com/getsentry/relay/pull/1282))
+- Fix typescript profile validation. ([#1283](https://github.com/getsentry/relay/pull/1283))
+- Track memory footprint of metrics buckets. ([#1284](https://github.com/getsentry/relay/pull/1284), [#1287](https://github.com/getsentry/relay/pull/1287), [#1288](https://github.com/getsentry/relay/pull/1288))
+- Support dedicated topics per metrics usecase, drop metrics from unknown usecases. ([#1285](https://github.com/getsentry/relay/pull/1285))
+- Add support for Rust profiles ingestion ([#1296](https://github.com/getsentry/relay/pull/1296))
 
 ## 22.5.0
 
@@ -175,7 +568,7 @@
 **Features**:
 
 - Add sampling based on transaction name. ([#1058](https://github.com/getsentry/relay/pull/1058))
-- Support running Relay without config directory. The most important configuration, including Relay mode and credentials, can now be provided through commandline arguments or environment variables alone. ([#1055](https://github.com/getsentry/relay/pull/1055)
+- Support running Relay without config directory. The most important configuration, including Relay mode and credentials, can now be provided through commandline arguments or environment variables alone. ([#1055](https://github.com/getsentry/relay/pull/1055))
 - Protocol support for client reports. ([#1081](https://github.com/getsentry/relay/pull/1081))
 - Extract session metrics in non processing relays. ([#1073](https://github.com/getsentry/relay/pull/1073))
 

@@ -144,6 +144,48 @@ pub struct Mechanism {
     ///   as the user explicitly captured the exception (and therefore kind of handled it)
     pub handled: Annotated<bool>,
 
+    /// An optional string value describing the source of the exception.
+    ///
+    /// For chained exceptions, this should contain the platform-specific name of the property or
+    /// attribute (on the parent exception) that this exception was acquired from. In the case of
+    /// an array, it should include the zero-based array index as well.
+    ///
+    /// - Python Examples: `"__context__"`, `"__cause__"`, `"exceptions[0]"`, `"exceptions[1]"`
+    ///
+    /// - .NET Examples:  `"InnerException"`, `"InnerExceptions[0]"`, `"InnerExceptions[1]"`
+    ///
+    /// - JavaScript Examples: `"cause"`, `"errors[0]"`, `"errors[1]"`
+    #[metastructure(
+        required = "false",
+        nonempty = "true",
+        max_chars = "enumlike",
+        deny_chars = " \t\r\n"
+    )]
+    pub source: Annotated<String>,
+
+    /// An optional boolean value, set `true` when the exception is the platform-specific exception
+    /// group type.  Defaults to `false`.
+    ///
+    /// For example, exceptions of type `ExceptionGroup` (Python), `AggregateException` (.NET), and
+    /// `AggregateError` (JavaScript) should have `"is_exception_group": true`.  Other exceptions
+    /// can omit this field.
+    pub is_exception_group: Annotated<bool>,
+
+    /// An optional numeric value providing an ID for the exception relative to this specific event.
+    /// It is referenced by the `parent_id` to reconstruct the logical tree of exceptions in an
+    /// exception group.
+    ///
+    /// This should contain an unsigned integer value starting with `0` for the last exception in
+    /// the exception values list, then `1` for the previous exception, etc.
+    pub exception_id: Annotated<u64>,
+
+    /// An optional numeric value pointing at the `exception_id` that is the direct parent of this
+    /// exception, used to reconstruct the logical tree of exceptions in an exception group.
+    ///
+    /// The last exception in the exception values list should omit this field, because it is the
+    /// root exception and thus has no parent.
+    pub parent_id: Annotated<u64>,
+
     /// Arbitrary extra data that might help the user understand the error thrown by this mechanism.
     #[metastructure(pii = "true", bag_size = "medium")]
     #[metastructure(skip_serialization = "empty")]
@@ -168,6 +210,10 @@ impl FromValue for Mechanism {
             pub description: Annotated<String>,
             pub help_link: Annotated<String>,
             pub handled: Annotated<bool>,
+            pub source: Annotated<String>,
+            pub is_exception_group: Annotated<bool>,
+            pub exception_id: Annotated<u64>,
+            pub parent_id: Annotated<u64>,
             pub data: Annotated<Object<Value>>,
             pub meta: Annotated<MechanismMeta>,
             #[metastructure(additional_properties)]
@@ -210,6 +256,10 @@ impl FromValue for Mechanism {
                         description: mechanism.description,
                         help_link: mechanism.help_link,
                         handled: mechanism.handled,
+                        source: mechanism.source,
+                        is_exception_group: mechanism.is_exception_group,
+                        exception_id: mechanism.exception_id,
+                        parent_id: mechanism.parent_id,
                         data: mechanism.data,
                         meta: mechanism.meta,
                         other: mechanism.other,
@@ -222,6 +272,10 @@ impl FromValue for Mechanism {
                         description: Annotated::empty(),
                         help_link: Annotated::empty(),
                         handled: Annotated::empty(),
+                        source: Annotated::empty(),
+                        is_exception_group: Annotated::empty(),
+                        exception_id: Annotated::empty(),
+                        parent_id: Annotated::empty(),
                         data: Annotated::new(legacy.other),
                         meta: Annotated::new(MechanismMeta {
                             errno: Annotated::empty(),
@@ -256,14 +310,24 @@ impl FromValue for Mechanism {
     }
 }
 
-#[test]
-fn test_mechanism_roundtrip() {
+#[cfg(test)]
+mod tests {
+    use similar_asserts::assert_eq;
+
+    use super::*;
     use crate::types::Map;
-    let json = r#"{
+
+    #[test]
+    fn test_mechanism_roundtrip() {
+        let json = r#"{
   "type": "mytype",
   "description": "mydescription",
   "help_link": "https://developer.apple.com/library/content/qa/qa1367/_index.html",
   "handled": false,
+  "source": "errors[0]",
+  "is_exception_group": false,
+  "exception_id": 1,
+  "parent_id": 0,
   "data": {
     "relevant_address": "0x1"
   },
@@ -292,42 +356,55 @@ fn test_mechanism_roundtrip() {
   },
   "other": "value"
 }"#;
-    let mechanism = Annotated::new(Mechanism {
-        ty: Annotated::new("mytype".to_string()),
-        synthetic: Annotated::empty(),
-        description: Annotated::new("mydescription".to_string()),
-        help_link: Annotated::new(
-            "https://developer.apple.com/library/content/qa/qa1367/_index.html".to_string(),
-        ),
-        handled: Annotated::new(false),
-        data: {
-            let mut map = Map::new();
-            map.insert(
-                "relevant_address".to_string(),
-                Annotated::new(Value::String("0x1".to_string())),
-            );
-            Annotated::new(map)
-        },
-        meta: Annotated::new(MechanismMeta {
-            errno: Annotated::new(CError {
-                number: Annotated::new(2),
-                name: Annotated::new("ENOENT".to_string()),
-            }),
-            mach_exception: Annotated::new(MachException {
-                ty: Annotated::new(1),
-                code: Annotated::new(1),
-                subcode: Annotated::new(8),
-                name: Annotated::new("EXC_BAD_ACCESS".to_string()),
-            }),
-            signal: Annotated::new(PosixSignal {
-                number: Annotated::new(11),
-                code: Annotated::new(0),
-                name: Annotated::new("SIGSEGV".to_string()),
-                code_name: Annotated::new("SEGV_NOOP".to_string()),
-            }),
-            ns_error: Annotated::new(NsError {
-                code: Annotated::new(-42),
-                domain: Annotated::new("SqlException".to_string()),
+        let mechanism = Annotated::new(Mechanism {
+            ty: Annotated::new("mytype".to_string()),
+            synthetic: Annotated::empty(),
+            description: Annotated::new("mydescription".to_string()),
+            help_link: Annotated::new(
+                "https://developer.apple.com/library/content/qa/qa1367/_index.html".to_string(),
+            ),
+            handled: Annotated::new(false),
+            source: Annotated::new("errors[0]".to_string()),
+            is_exception_group: Annotated::new(false),
+            exception_id: Annotated::new(1),
+            parent_id: Annotated::new(0),
+            data: {
+                let mut map = Map::new();
+                map.insert(
+                    "relevant_address".to_string(),
+                    Annotated::new(Value::String("0x1".to_string())),
+                );
+                Annotated::new(map)
+            },
+            meta: Annotated::new(MechanismMeta {
+                errno: Annotated::new(CError {
+                    number: Annotated::new(2),
+                    name: Annotated::new("ENOENT".to_string()),
+                }),
+                mach_exception: Annotated::new(MachException {
+                    ty: Annotated::new(1),
+                    code: Annotated::new(1),
+                    subcode: Annotated::new(8),
+                    name: Annotated::new("EXC_BAD_ACCESS".to_string()),
+                }),
+                signal: Annotated::new(PosixSignal {
+                    number: Annotated::new(11),
+                    code: Annotated::new(0),
+                    name: Annotated::new("SIGSEGV".to_string()),
+                    code_name: Annotated::new("SEGV_NOOP".to_string()),
+                }),
+                ns_error: Annotated::new(NsError {
+                    code: Annotated::new(-42),
+                    domain: Annotated::new("SqlException".to_string()),
+                }),
+                other: {
+                    let mut map = Object::new();
+                    map.insert(
+                        "other".to_string(),
+                        Annotated::new(Value::String("value".to_string())),
+                    );
+                    map
+                },
             }),
             other: {
                 let mut map = Object::new();
@@ -337,44 +414,33 @@ fn test_mechanism_roundtrip() {
                 );
                 map
             },
-        }),
-        other: {
-            let mut map = Object::new();
-            map.insert(
-                "other".to_string(),
-                Annotated::new(Value::String("value".to_string())),
-            );
-            map
-        },
-    });
+        });
 
-    assert_eq_dbg!(mechanism, Annotated::from_json(json).unwrap());
-    assert_eq_str!(json, mechanism.to_json_pretty().unwrap());
-}
+        assert_eq!(mechanism, Annotated::from_json(json).unwrap());
+        assert_eq!(json, mechanism.to_json_pretty().unwrap());
+    }
 
-#[test]
-fn test_mechanism_default_values() {
-    let json = r#"{"type":"mytype"}"#;
-    let mechanism = Annotated::new(Mechanism {
-        ty: Annotated::new("mytype".to_string()),
-        ..Default::default()
-    });
+    #[test]
+    fn test_mechanism_default_values() {
+        let json = r#"{"type":"mytype"}"#;
+        let mechanism = Annotated::new(Mechanism {
+            ty: Annotated::new("mytype".to_string()),
+            ..Default::default()
+        });
 
-    assert_eq_dbg!(mechanism, Annotated::from_json(json).unwrap());
-    assert_eq_str!(json, mechanism.to_json().unwrap());
-}
+        assert_eq!(mechanism, Annotated::from_json(json).unwrap());
+        assert_eq!(json, mechanism.to_json().unwrap());
+    }
 
-#[test]
-fn test_mechanism_empty() {
-    let mechanism = Annotated::<Mechanism>::empty();
-    assert_eq_dbg!(mechanism, Annotated::from_json("{}").unwrap());
-}
+    #[test]
+    fn test_mechanism_empty() {
+        let mechanism = Annotated::<Mechanism>::empty();
+        assert_eq!(mechanism, Annotated::from_json("{}").unwrap());
+    }
 
-#[test]
-fn test_mechanism_legacy_conversion() {
-    use crate::types::Map;
-
-    let input = r#"{
+    #[test]
+    fn test_mechanism_legacy_conversion() {
+        let input = r#"{
   "posix_signal": {
     "name": "SIGSEGV",
     "code_name": "SEGV_NOOP",
@@ -390,7 +456,7 @@ fn test_mechanism_legacy_conversion() {
   }
 }"#;
 
-    let output = r#"{
+        let output = r#"{
   "type": "generic",
   "data": {
     "relevant_address": "0x1"
@@ -410,40 +476,45 @@ fn test_mechanism_legacy_conversion() {
     }
   }
 }"#;
-    let mechanism = Annotated::new(Mechanism {
-        ty: Annotated::new("generic".to_string()),
-        synthetic: Annotated::empty(),
-        description: Annotated::empty(),
-        help_link: Annotated::empty(),
-        handled: Annotated::empty(),
-        data: {
-            let mut map = Map::new();
-            map.insert(
-                "relevant_address".to_string(),
-                Annotated::new(Value::String("0x1".to_string())),
-            );
-            Annotated::new(map)
-        },
-        meta: Annotated::new(MechanismMeta {
-            errno: Annotated::empty(),
-            mach_exception: Annotated::new(MachException {
-                ty: Annotated::new(1),
-                code: Annotated::new(1),
-                subcode: Annotated::new(8),
-                name: Annotated::new("EXC_BAD_ACCESS".to_string()),
+        let mechanism = Annotated::new(Mechanism {
+            ty: Annotated::new("generic".to_string()),
+            synthetic: Annotated::empty(),
+            description: Annotated::empty(),
+            help_link: Annotated::empty(),
+            handled: Annotated::empty(),
+            source: Annotated::empty(),
+            is_exception_group: Annotated::empty(),
+            exception_id: Annotated::empty(),
+            parent_id: Annotated::empty(),
+            data: {
+                let mut map = Map::new();
+                map.insert(
+                    "relevant_address".to_string(),
+                    Annotated::new(Value::String("0x1".to_string())),
+                );
+                Annotated::new(map)
+            },
+            meta: Annotated::new(MechanismMeta {
+                errno: Annotated::empty(),
+                mach_exception: Annotated::new(MachException {
+                    ty: Annotated::new(1),
+                    code: Annotated::new(1),
+                    subcode: Annotated::new(8),
+                    name: Annotated::new("EXC_BAD_ACCESS".to_string()),
+                }),
+                signal: Annotated::new(PosixSignal {
+                    number: Annotated::new(11),
+                    code: Annotated::new(0),
+                    name: Annotated::new("SIGSEGV".to_string()),
+                    code_name: Annotated::new("SEGV_NOOP".to_string()),
+                }),
+                ns_error: Annotated::empty(),
+                other: Object::default(),
             }),
-            signal: Annotated::new(PosixSignal {
-                number: Annotated::new(11),
-                code: Annotated::new(0),
-                name: Annotated::new("SIGSEGV".to_string()),
-                code_name: Annotated::new("SEGV_NOOP".to_string()),
-            }),
-            ns_error: Annotated::empty(),
             other: Object::default(),
-        }),
-        other: Object::default(),
-    });
+        });
 
-    assert_eq_dbg!(mechanism, Annotated::from_json(input).unwrap());
-    assert_eq_str!(output, mechanism.to_json_pretty().unwrap());
+        assert_eq!(mechanism, Annotated::from_json(input).unwrap());
+        assert_eq!(output, mechanism.to_json_pretty().unwrap());
+    }
 }

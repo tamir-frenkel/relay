@@ -30,6 +30,9 @@
 //! ...
 //! ```
 //!
+//! Note that the name format used in the statsd protocol is different from the MRI: Metric names
+//! are not prefixed with `<ty>:` as the type is somewhere else in the protocol.
+//!
 //! The timestamp in the item header is used to send backdated metrics. If it is omitted,
 //! the `received` time of the envelope is assumed.
 //!
@@ -52,6 +55,7 @@
 //!     "value": [36, 49, 57, 68],
 //!     "type": "d",
 //!     "timestamp": 1615889440,
+//!     "width": 10,
 //!     "tags": {
 //!       "route": "user_index"
 //!     }
@@ -61,6 +65,7 @@
 //!     "value": 4,
 //!     "type": "c",
 //!     "timestamp": 1615889440,
+//!     "width": 10,
 //!     "tags": {
 //!       "route": "user_index"
 //!     }
@@ -93,6 +98,7 @@
     html_logo_url = "https://raw.githubusercontent.com/getsentry/relay/master/artwork/relay-icon.png",
     html_favicon_url = "https://raw.githubusercontent.com/getsentry/relay/master/artwork/relay-icon.png"
 )]
+#![allow(clippy::derive_partial_eq_without_eq)]
 
 mod aggregation;
 mod protocol;

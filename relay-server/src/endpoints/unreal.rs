@@ -1,68 +1,77 @@
-use actix_web::{actix::ResponseFuture, HttpRequest, HttpResponse};
-use futures::Future;
-
+use axum::extract::{DefaultBodyLimit, FromRequest, Query};
+use axum::response::IntoResponse;
+use axum::routing::{post, MethodRouter};
+use bytes::Bytes;
+use relay_config::Config;
 use relay_general::protocol::EventId;
+use serde::Deserialize;
 
-use crate::body::RequestBody;
 use crate::constants::UNREAL_USER_HEADER;
-use crate::endpoints::common::{self, BadStoreRequest};
+use crate::endpoints::common::{self, BadStoreRequest, TextResponse};
 use crate::envelope::{ContentType, Envelope, Item, ItemType};
 use crate::extractors::RequestMeta;
-use crate::service::{ServiceApp, ServiceState};
+use crate::service::ServiceState;
 
-fn extract_envelope(
-    request: &HttpRequest<ServiceState>,
-    meta: RequestMeta,
-) -> ResponseFuture<Envelope, BadStoreRequest> {
-    let user_id = request.query().get("UserID").cloned();
-    let max_payload_size = request.state().config().max_attachments_size();
-
-    let future = RequestBody::new(request, max_payload_size)
-        .map_err(BadStoreRequest::PayloadError)
-        .and_then(move |data| {
-            if data.is_empty() {
-                return Err(BadStoreRequest::EmptyBody);
-            }
-
-            let mut envelope = Envelope::from_request(Some(EventId::new()), meta);
-
-            let mut item = Item::new(ItemType::UnrealReport);
-            item.set_payload(ContentType::OctetStream, data);
-            envelope.add_item(item);
-
-            if let Some(user_id) = user_id {
-                envelope.set_header(UNREAL_USER_HEADER, user_id);
-            }
-
-            Ok(envelope)
-        });
-
-    Box::new(future)
+#[derive(Debug, Deserialize)]
+struct UnrealQuery {
+    #[serde(rename = "UserID")]
+    user_id: Option<String>,
 }
 
-fn store_unreal(
+#[derive(Debug, FromRequest)]
+#[from_request(state(ServiceState))]
+struct UnrealParams {
     meta: RequestMeta,
-    request: HttpRequest<ServiceState>,
-) -> ResponseFuture<HttpResponse, BadStoreRequest> {
-    common::handle_store_like_request(
-        meta,
-        request,
-        extract_envelope,
-        // The return here is only useful for consistency because the UE4 crash reporter doesn't
-        // care about it.
-        common::create_text_event_id_response,
-        false,
-    )
+    #[from_request(via(Query))]
+    query: UnrealQuery,
+    data: Bytes,
 }
 
-pub fn configure_app(app: ServiceApp) -> ServiceApp {
-    common::cors(app)
-        .resource(
-            &common::normpath(r"/api/{project:\d+}/unreal/{sentry_key:\w+}/"),
-            |r| {
-                r.name("store-unreal");
-                r.post().with(store_unreal);
-            },
-        )
-        .register()
+impl UnrealParams {
+    fn extract_envelope(self) -> Result<Box<Envelope>, BadStoreRequest> {
+        let Self { meta, query, data } = self;
+
+        if data.is_empty() {
+            return Err(BadStoreRequest::EmptyBody);
+        }
+
+        let mut envelope = Envelope::from_request(Some(EventId::new()), meta);
+
+        let mut item = Item::new(ItemType::UnrealReport);
+        item.set_payload(ContentType::OctetStream, data);
+        envelope.add_item(item);
+
+        if let Some(user_id) = query.user_id {
+            envelope.set_header(UNREAL_USER_HEADER, user_id);
+        }
+
+        Ok(envelope)
+    }
+}
+
+async fn handle(
+    state: ServiceState,
+    params: UnrealParams,
+) -> Result<impl IntoResponse, BadStoreRequest> {
+    let envelope = params.extract_envelope()?;
+    let id = envelope.event_id();
+
+    // Never respond with a 429 since clients often retry these
+    match common::handle_envelope(&state, envelope).await {
+        Ok(_) | Err(BadStoreRequest::RateLimited(_)) => (),
+        Err(error) => return Err(error),
+    };
+
+    // The return here is only useful for consistency because the UE4 crash reporter doesn't
+    // care about it.
+    Ok(TextResponse(id))
+}
+
+pub fn route<B>(config: &Config) -> MethodRouter<ServiceState, B>
+where
+    B: axum::body::HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<axum::BoxError>,
+{
+    post(handle).route_layer(DefaultBodyLimit::max(config.max_attachments_size()))
 }

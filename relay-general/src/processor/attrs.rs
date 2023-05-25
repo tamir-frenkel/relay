@@ -1,18 +1,25 @@
 use std::borrow::Cow;
 use std::fmt;
-use std::ops::RangeInclusive;
+use std::ops::{Deref, RangeInclusive};
 
 use enumset::{EnumSet, EnumSetType};
-use failure::Fail;
 use smallvec::SmallVec;
 
+use crate::macros::derive_fromstr_and_display;
 use crate::processor::{ProcessValue, SelectorPathItem, SelectorSpec};
 use crate::types::Annotated;
 
 /// Error for unknown value types.
-#[derive(Debug, Fail)]
-#[fail(display = "unknown value type")]
+#[derive(Debug)]
 pub struct UnknownValueTypeError;
+
+impl fmt::Display for UnknownValueTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown value type")
+    }
+}
+
+impl std::error::Error for UnknownValueTypeError {}
 
 /// The (simplified) type of a value.
 #[derive(Debug, Ord, PartialOrd, EnumSetType)]
@@ -29,6 +36,7 @@ pub enum ValueType {
     // Roots
     Event,
     Attachments,
+    Replay,
 
     // Protocol types
     Exception,
@@ -68,6 +76,7 @@ derive_fromstr_and_display!(ValueType, UnknownValueTypeError, {
     ValueType::Object => "object",
     ValueType::Event => "event",
     ValueType::Attachments => "attachments",
+    ValueType::Replay => "replay",
     ValueType::Exception => "error" | "exception",
     ValueType::Stacktrace => "stack" | "stacktrace",
     ValueType::Frame => "frame",
@@ -100,6 +109,7 @@ pub enum MaxChars {
     TagKey,
     TagValue,
     Environment,
+    Distribution,
     Hard(usize),
     Soft(usize),
 }
@@ -122,6 +132,7 @@ impl MaxChars {
             MaxChars::TagKey => 32,
             MaxChars::TagValue => 200,
             MaxChars::Environment => 64,
+            MaxChars::Distribution => 64,
             MaxChars::Soft(len) | MaxChars::Hard(len) => len,
         }
     }
@@ -142,6 +153,7 @@ impl MaxChars {
             MaxChars::TagKey => 0,
             MaxChars::TagValue => 0,
             MaxChars::Environment => 0,
+            MaxChars::Distribution => 0,
             MaxChars::Soft(_) => 10,
             MaxChars::Hard(_) => 0,
         }
@@ -316,15 +328,13 @@ impl Default for FieldAttrs {
 #[derive(Debug, Clone, Eq, Ord, PartialOrd)]
 enum PathItem<'a> {
     StaticKey(&'a str),
+    OwnedKey(String),
     Index(usize),
 }
 
 impl<'a> PartialEq for PathItem<'a> {
     fn eq(&self, other: &PathItem<'a>) -> bool {
-        match *self {
-            PathItem::StaticKey(s) => other.key() == Some(s),
-            PathItem::Index(value) => other.index() == Some(value),
-        }
+        self.key() == other.key() && self.index() == other.index()
     }
 }
 
@@ -332,8 +342,9 @@ impl<'a> PathItem<'a> {
     /// Returns the key if there is one
     #[inline]
     pub fn key(&self) -> Option<&str> {
-        match *self {
+        match self {
             PathItem::StaticKey(s) => Some(s),
+            PathItem::OwnedKey(s) => Some(s.as_str()),
             PathItem::Index(_) => None,
         }
     }
@@ -341,18 +352,45 @@ impl<'a> PathItem<'a> {
     /// Returns the index if there is one
     #[inline]
     pub fn index(&self) -> Option<usize> {
-        match *self {
-            PathItem::StaticKey(_) => None,
-            PathItem::Index(idx) => Some(idx),
+        match self {
+            PathItem::StaticKey(_) | PathItem::OwnedKey(_) => None,
+            PathItem::Index(idx) => Some(*idx),
         }
     }
 }
 
 impl<'a> fmt::Display for PathItem<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
+        match self {
             PathItem::StaticKey(s) => f.pad(s),
-            PathItem::Index(val) => write!(f, "{}", val),
+            PathItem::OwnedKey(s) => f.pad(s.as_str()),
+            PathItem::Index(val) => write!(f, "{val}"),
+        }
+    }
+}
+
+/// Like [`std::borrow::Cow`], but with a boxed value.
+///
+/// This is useful for types that contain themselves, where otherwise the layout of the type
+/// cannot be computed, for example
+///
+/// ```rust,ignore
+/// struct Foo<'a>(Cow<'a, Foo<'a>>); // will not compile
+/// struct Bar<'a>(BoxCow<'a, Bar<'a>>); // will compile
+/// ```
+#[derive(Debug, Clone)]
+enum BoxCow<'a, T> {
+    Borrowed(&'a T),
+    Owned(Box<T>),
+}
+
+impl<T> Deref for BoxCow<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            BoxCow::Borrowed(inner) => inner,
+            BoxCow::Owned(inner) => inner.deref(),
         }
     }
 }
@@ -372,7 +410,12 @@ impl<'a> fmt::Display for PathItem<'a> {
 /// the path items in the processing state and check whether a selector matches.
 #[derive(Debug, Clone)]
 pub struct ProcessingState<'a> {
-    parent: Option<&'a ProcessingState<'a>>,
+    // In event scrubbing, every state holds a reference to its parent.
+    // In Replay scrubbing, we do not call `process_*` recursively,
+    // but instead hold a single `ProcessingState` that represents the current item.
+    // This item owns its parent (plus ancestors) exclusively, which is why we use `BoxCow` here
+    // rather than `Rc` / `Arc`.
+    parent: Option<BoxCow<'a, ProcessingState<'a>>>,
     path_item: Option<PathItem<'a>>,
     attrs: Option<Cow<'a, FieldAttrs>>,
     value_type: EnumSet<ValueType>,
@@ -415,7 +458,7 @@ impl<'a> ProcessingState<'a> {
         value_type: impl IntoIterator<Item = ValueType>,
     ) -> Self {
         ProcessingState {
-            parent: Some(self),
+            parent: Some(BoxCow::Borrowed(self)),
             path_item: Some(PathItem::StaticKey(key)),
             attrs,
             value_type: value_type.into_iter().collect(),
@@ -431,11 +474,30 @@ impl<'a> ProcessingState<'a> {
         value_type: impl IntoIterator<Item = ValueType>,
     ) -> Self {
         ProcessingState {
-            parent: Some(self),
+            parent: Some(BoxCow::Borrowed(self)),
             path_item: Some(PathItem::StaticKey(key)),
             attrs,
             value_type: value_type.into_iter().collect(),
             depth: self.depth + 1,
+        }
+    }
+
+    /// Derives a processing state by entering an owned key.
+    ///
+    /// The new (child) state takes ownership of the current (parent) state.
+    pub fn enter_owned(
+        self,
+        key: String,
+        attrs: Option<Cow<'a, FieldAttrs>>,
+        value_type: impl IntoIterator<Item = ValueType>,
+    ) -> Self {
+        let depth = self.depth + 1;
+        ProcessingState {
+            parent: Some(BoxCow::Owned(self.into())),
+            path_item: Some(PathItem::OwnedKey(key)),
+            attrs,
+            value_type: value_type.into_iter().collect(),
+            depth,
         }
     }
 
@@ -447,7 +509,7 @@ impl<'a> ProcessingState<'a> {
         value_type: impl IntoIterator<Item = ValueType>,
     ) -> Self {
         ProcessingState {
-            parent: Some(self),
+            parent: Some(BoxCow::Borrowed(self)),
             path_item: Some(PathItem::Index(idx)),
             attrs,
             value_type: value_type.into_iter().collect(),
@@ -460,7 +522,7 @@ impl<'a> ProcessingState<'a> {
         ProcessingState {
             attrs,
             path_item: None,
-            parent: Some(self),
+            parent: Some(BoxCow::Borrowed(self)),
             ..self.clone()
         }
     }
@@ -502,6 +564,18 @@ impl<'a> ProcessingState<'a> {
         }
     }
 
+    /// Returns the contained parent state.
+    ///
+    /// - Returns `Ok(None)` if the current state is the root.
+    /// - Returns `Err(self)` if the current state does not own the parent state.
+    pub fn try_into_parent(self) -> Result<Option<Self>, Self> {
+        match self.parent {
+            Some(BoxCow::Borrowed(_)) => Err(self),
+            Some(BoxCow::Owned(parent)) => Ok(Some(*parent)),
+            None => Ok(None),
+        }
+    }
+
     /// Return the depth (~ indentation level) of the currently processed value.
     pub fn depth(&'a self) -> usize {
         self.depth
@@ -511,7 +585,7 @@ impl<'a> ProcessingState<'a> {
     ///
     /// This is `false` when we entered a newtype struct.
     pub fn entered_anything(&'a self) -> bool {
-        if let Some(parent) = self.parent {
+        if let Some(parent) = &self.parent {
             parent.depth() != self.depth()
         } else {
             true
@@ -541,7 +615,7 @@ impl<'a> Iterator for ProcessingStateIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.state?;
-        self.state = current.parent;
+        self.state = current.parent.as_deref();
         Some(current)
     }
 
@@ -660,7 +734,7 @@ impl<'a> fmt::Display for Path<'a> {
             if idx > 0 {
                 write!(f, ".")?;
             }
-            write!(f, "{}", item)?;
+            write!(f, "{item}")?;
         }
         Ok(())
     }

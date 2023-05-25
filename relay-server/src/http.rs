@@ -1,4 +1,4 @@
-///! Abstractions for dealing with either actix-web client structs or reqwest structs.
+///! Abstractions for dealing with HTTP clients.
 ///!
 ///! All of it is implemented as enums because if they were traits, they'd have to be boxed to be
 ///! transferrable between actors. Trait objects in turn do not allow for consuming self, using
@@ -10,26 +10,23 @@
 ///! logic.
 use std::io;
 
-use failure::Fail;
-use futures::prelude::*;
-use futures03::{FutureExt, TryFutureExt, TryStreamExt};
+use relay_config::HttpEncoding;
+use reqwest::header::{HeaderMap, HeaderValue};
+pub use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 
-use relay_config::HttpEncoding;
-
-#[doc(inline)]
-pub use reqwest::StatusCode;
-
-#[derive(Fail, Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HttpError {
-    #[fail(display = "payload too large")]
+    #[error("payload too large")]
     Overflow,
-    #[fail(display = "could not send request")]
-    Reqwest(#[cause] reqwest::Error),
-    #[fail(display = "failed to stream payload")]
-    Io(#[cause] io::Error),
-    #[fail(display = "failed to parse JSON response")]
-    Json(#[cause] serde_json::Error),
+    #[error("attempted to send upstream request without credentials configured")]
+    NoCredentials,
+    #[error("could not send request")]
+    Reqwest(#[from] reqwest::Error),
+    #[error("failed to stream payload")]
+    Io(#[from] io::Error),
+    #[error("failed to parse JSON response")]
+    Json(#[from] serde_json::Error),
 }
 
 impl HttpError {
@@ -38,23 +35,12 @@ impl HttpError {
         match self {
             Self::Io(_) => true,
             // note: status codes are not handled here because we never call error_for_status. This
-            // logic is part of upstream actor.
+            // logic is part of upstream service.
             Self::Reqwest(error) => error.is_timeout(),
             Self::Json(_) => false,
             HttpError::Overflow => false,
+            HttpError::NoCredentials => false,
         }
-    }
-}
-
-impl From<reqwest::Error> for HttpError {
-    fn from(e: reqwest::Error) -> Self {
-        HttpError::Reqwest(e)
-    }
-}
-
-impl From<io::Error> for HttpError {
-    fn from(e: io::Error) -> Self {
-        HttpError::Io(e)
     }
 }
 
@@ -74,10 +60,8 @@ impl RequestBuilder {
     }
 
     /// Add a new header, not replacing existing ones.
-    pub fn header(&mut self, key: impl AsRef<str>, value: impl AsRef<[u8]>) -> &mut Self {
-        take_mut::take(&mut self.builder, |b| {
-            b.header(key.as_ref(), value.as_ref())
-        });
+    pub fn header(mut self, key: impl AsRef<str>, value: impl AsRef<[u8]>) -> Self {
+        self.builder = self.builder.header(key.as_ref(), value.as_ref());
         self
     }
 
@@ -85,29 +69,21 @@ impl RequestBuilder {
     ///
     /// If the value is `Some`, the header is added. If the value is `None`, headers are not
     /// changed.
-    pub fn header_opt(
-        &mut self,
-        key: impl AsRef<str>,
-        value: Option<impl AsRef<[u8]>>,
-    ) -> &mut Self {
+    pub fn header_opt(mut self, key: impl AsRef<str>, value: Option<impl AsRef<[u8]>>) -> Self {
         if let Some(value) = value {
-            take_mut::take(&mut self.builder, |b| {
-                b.header(key.as_ref(), value.as_ref())
-            });
+            self.builder = self.builder.header(key.as_ref(), value.as_ref());
         }
         self
     }
 
-    pub fn body<B: AsRef<[u8]>>(mut self, body: B) -> Result<Request, HttpError> {
-        self.builder = self.builder.body(body.as_ref().to_vec());
-        self.finish()
+    pub fn content_encoding(self, encoding: HttpEncoding) -> Self {
+        self.header_opt("content-encoding", encoding.name())
     }
 
-    pub fn content_encoding(&mut self, encoding: HttpEncoding) -> &mut Self {
-        match encoding.name() {
-            Some(name) => self.header("Content-Encoding", name),
-            None => self,
-        }
+    pub fn body<B: AsRef<[u8]>>(mut self, body: B) -> Result<Request, HttpError> {
+        // TODO: This clones data. Change the signature to require `Bytes` to prevent cloning.
+        self.builder = self.builder.body(body.as_ref().to_vec());
+        self.finish()
     }
 }
 
@@ -118,35 +94,12 @@ impl Response {
         self.0.status()
     }
 
-    pub fn json<T: 'static + DeserializeOwned>(
-        self,
-        limit: usize,
-    ) -> Box<dyn Future<Item = T, Error = HttpError>> {
-        let future = self
-            .bytes(limit)
-            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(HttpError::Json));
-        Box::new(future)
-    }
-
-    pub fn consume(mut self) -> Box<dyn Future<Item = Self, Error = HttpError>> {
-        // Consume the request payload such that the underlying connection returns to a
-        // "clean state".
-        //
-        // We do not understand if this is strictly necessary for reqwest. It was ported
-        // from actix-web where it was clearly necessary to un-break keepalive connections,
-        // but no testcase has been written for this and we are unsure on how to reproduce
-        // outside of prod. I (markus) have not found code in reqwest that would explicitly
-        // deal with this.
-        Box::new(
-            // Note: The reqwest codepath is impossible to write with streams due to
-            // borrowing issues. You *have* to use `chunk()`.
-            async move {
-                while self.0.chunk().await?.is_some() {}
-                Ok(self)
-            }
-            .boxed_local()
-            .compat(),
-        )
+    pub async fn consume(&mut self) -> Result<(), HttpError> {
+        // Consume the request payload such that the underlying connection returns to a "clean
+        // state" and can be reused by the client. This is explicitly required, see:
+        // https://github.com/seanmonstar/reqwest/issues/1272#issuecomment-839813308
+        while self.0.chunk().await?.is_some() {}
+        Ok(())
     }
 
     pub fn get_header(&self, key: impl AsRef<str>) -> Option<&[u8]> {
@@ -162,32 +115,30 @@ impl Response {
             .collect()
     }
 
-    pub fn clone_headers(&self) -> Vec<(String, Vec<u8>)> {
-        self.0
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.as_str().to_owned(), v.as_bytes().to_owned()))
-            .collect()
+    pub fn headers(&self) -> &HeaderMap<HeaderValue> {
+        self.0.headers()
     }
 
-    pub fn bytes(self, limit: usize) -> Box<dyn Future<Item = Vec<u8>, Error = HttpError>> {
-        Box::new(
-            self.0
-                .bytes_stream()
-                .map_err(HttpError::Reqwest)
-                .try_fold(
-                    Vec::with_capacity(8192),
-                    move |mut body, chunk| async move {
-                        if (body.len() + chunk.len()) > limit {
-                            Err(HttpError::Overflow)
-                        } else {
-                            body.extend_from_slice(&chunk);
-                            Ok(body)
-                        }
-                    },
-                )
-                .boxed_local()
-                .compat(),
-        )
+    pub async fn bytes(self, limit: usize) -> Result<Vec<u8>, HttpError> {
+        let Self(mut request) = self;
+
+        let mut body = Vec::with_capacity(limit.min(8192));
+        while let Some(chunk) = request.chunk().await? {
+            if (body.len() + chunk.len()) > limit {
+                return Err(HttpError::Overflow);
+            }
+
+            body.extend_from_slice(&chunk);
+        }
+
+        Ok(body)
+    }
+
+    pub async fn json<T>(self, limit: usize) -> Result<T, HttpError>
+    where
+        T: 'static + DeserializeOwned,
+    {
+        let bytes = self.bytes(limit).await?;
+        serde_json::from_slice(&bytes).map_err(HttpError::Json)
     }
 }

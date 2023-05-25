@@ -1,7 +1,8 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{de, ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
+use serde::ser::SerializeSeq;
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use smallvec::SmallVec;
 
 use crate::processor::estimate_size;
@@ -303,7 +304,7 @@ impl Error {
     pub fn expected(expectation: &str) -> Self {
         // Does not use `Error::invalid` to avoid the string copy.
         Error::with(ErrorKind::InvalidData, |error| {
-            error.insert("reason", format!("expected {}", expectation));
+            error.insert("reason", format!("expected {expectation}"));
         })
     }
 
@@ -311,6 +312,12 @@ impl Error {
     pub fn nonempty() -> Self {
         // TODO: Replace `invalid_data` this with an explicity error constant for empty values
         Error::invalid("expected a non-empty value")
+    }
+
+    /// Creates an error that describes an expected non-empty string.
+    pub fn nonempty_string() -> Self {
+        // TODO: Replace `invalid_data` this with an explicity error constant for empty values
+        Error::invalid("expected a non-empty string")
     }
 
     /// Returns the kind of this error.
@@ -405,7 +412,7 @@ impl Serialize for Error {
 /// Meta information for a data field in the event payload.
 #[derive(Clone, Deserialize, Serialize)]
 pub struct MetaInner {
-    /// Remarks detailling modifications of this field.
+    /// Remarks detailing modifications of this field.
     #[serde(default, skip_serializing_if = "SmallVec::is_empty", rename = "rem")]
     remarks: SmallVec<[Remark; 3]>,
 
@@ -474,7 +481,7 @@ impl Meta {
     }
 
     fn upsert(&mut self) -> &mut MetaInner {
-        self.0.get_or_insert_with(|| Box::new(MetaInner::default()))
+        self.0.get_or_insert_with(|| Box::default())
     }
 
     /// The original length of this field, if applicable.
@@ -546,6 +553,11 @@ impl Meta {
     /// Returns a reference to the original value, if any.
     pub fn original_value(&self) -> Option<&Value> {
         self.0.as_ref().and_then(|x| x.original_value.as_ref())
+    }
+
+    /// Returns a mutable reference to the original value, if any.
+    pub fn original_value_as_mut(&mut self) -> Option<&mut Value> {
+        self.0.as_mut().and_then(|x| x.original_value.as_mut())
     }
 
     /// Sets the original value.

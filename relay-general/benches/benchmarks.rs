@@ -1,13 +1,12 @@
-use std::fmt;
-use std::fs;
+use std::{fmt, fs};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-
 use relay_general::pii::{DataScrubbingConfig, PiiProcessor};
 use relay_general::processor::{process_value, SelectorSpec};
 use relay_general::protocol::{Event, IpAddr};
 use relay_general::store::{StoreConfig, StoreProcessor};
 use relay_general::types::Annotated;
+use relay_general::user_agent::ClientHints;
 
 fn load_all_fixtures() -> Vec<BenchmarkInput<String>> {
     let mut rv = Vec::new();
@@ -91,6 +90,10 @@ fn bench_store_processor(c: &mut Criterion) {
         sent_at: None,
         received_at: None,
         breakdowns: None,
+        span_attributes: Default::default(),
+        client_sample_rate: None,
+        replay_id: None,
+        client_hints: ClientHints::default(),
     };
 
     let mut processor = StoreProcessor::new(config, None);
@@ -138,7 +141,7 @@ fn bench_pii_stripping(c: &mut Criterion) {
         |b, datascrubbing_config| b.iter(|| datascrubbing_config.pii_config_uncached()),
     );
 
-    let pii_config = datascrubbing_config.pii_config_uncached().unwrap();
+    let pii_config = datascrubbing_config.pii_config_uncached().unwrap().unwrap();
 
     group.bench_with_input(
         BenchmarkId::new("compile_pii_config", config_name),

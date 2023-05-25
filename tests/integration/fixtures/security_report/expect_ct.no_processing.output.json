@@ -1,12 +1,31 @@
 {
   "type": "expectct",
+  "contexts": {
+    "browser": {
+      "name": "Chrome",
+      "type": "browser",
+      "version": "74.0.3729"
+    },
+    "client_os": {
+      "name": "Windows",
+      "type": "os",
+      "version": ">=10"
+    }
+  },
   "culprit": "www.example.com",
   "logentry": {
     "formatted": "Expect-CT failed for 'www.example.com'"
   },
+  "logger": "csp",
   "release": "01d5c3165d9fbc5c8bdcf9550a1d6793a80fc02b",
   "environment": "production",
   "request": {
+    "headers": [
+      [
+        "User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.169 Safari/537.36"
+      ]
+    ],
     "url": "www.example.com"
   },
   "tags": [
@@ -38,5 +57,8 @@
         "serialized_sct": "ABCD=="
       }
     ]
+  },
+  "user": {
+    "ip_address": "127.0.0.1"
   }
 }

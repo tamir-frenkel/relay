@@ -1,7 +1,6 @@
 //! Implements filtering for events originating from the localhost
-use url::Url;
-
 use relay_general::protocol::Event;
+use url::Url;
 
 use crate::{FilterConfig, FilterStatKey};
 
@@ -54,10 +53,10 @@ fn get_url(event: &Event) -> Option<Url> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use relay_general::protocol::{IpAddr, Request, User};
     use relay_general::types::Annotated;
+
+    use super::*;
 
     fn get_event_with_ip_addr(val: &str) -> Event {
         Event {
@@ -72,7 +71,7 @@ mod tests {
     fn get_event_with_domain(val: &str) -> Event {
         Event {
             request: Annotated::from(Request {
-                url: Annotated::from(format!("http://{}:8080/", val)),
+                url: Annotated::from(format!("http://{val}:8080/")),
                 ..Request::default()
             }),
             ..Event::default()
@@ -102,8 +101,7 @@ mod tests {
             assert_ne!(
                 filter_result,
                 Ok(()),
-                "Failed to filter address '{}'",
-                ip_addr
+                "Failed to filter address '{ip_addr}'"
             );
         }
     }
@@ -116,8 +114,7 @@ mod tests {
             assert_eq!(
                 filter_result,
                 Ok(()),
-                "Filtered valid ip address '{}'",
-                ip_addr
+                "Filtered valid ip address '{ip_addr}'"
             );
         }
     }
@@ -138,12 +135,7 @@ mod tests {
         for domain in &["127.0.0.1", "localhost"] {
             let event = get_event_with_domain(domain);
             let filter_result = should_filter(&event, &FilterConfig { is_enabled: true });
-            assert_ne!(
-                filter_result,
-                Ok(()),
-                "Failed to filter domain '{}'",
-                domain
-            );
+            assert_ne!(filter_result, Ok(()), "Failed to filter domain '{domain}'");
         }
     }
 
@@ -155,8 +147,7 @@ mod tests {
             assert_eq!(
                 filter_result,
                 Ok(()),
-                "Filtered perfectly valid domain '{}'",
-                domain
+                "Filtered perfectly valid domain '{domain}'"
             );
         }
     }

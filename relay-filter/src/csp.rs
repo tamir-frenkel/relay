@@ -29,6 +29,9 @@ where
         if matches_any_origin(csp.source_file.as_str(), &disallowed_sources) {
             return true;
         }
+        if matches_any_origin(csp.document_uri.as_str(), &disallowed_sources) {
+            return true;
+        }
     }
     false
 }
@@ -120,7 +123,7 @@ pub fn matches_any_origin(url: Option<&str>, origins: &[SchemeDomainPort]) -> bo
     // if we have a "*" (Any) option, anything matches so don't bother going forward
     if origins
         .iter()
-        .any(|o| o.scheme == None && o.port == None && o.domain == None)
+        .any(|o| o.scheme.is_none() && o.port.is_none() && o.domain.is_none())
     {
         return true;
     }
@@ -129,13 +132,13 @@ pub fn matches_any_origin(url: Option<&str>, origins: &[SchemeDomainPort]) -> bo
         let url = SchemeDomainPort::from(url);
 
         for origin in origins {
-            if origin.scheme != None && url.scheme != origin.scheme {
+            if origin.scheme.is_some() && url.scheme != origin.scheme {
                 continue; // scheme not matched
             }
-            if origin.port != None && url.port != origin.port {
+            if origin.port.is_some() && url.port != origin.port {
                 continue; // port not matched
             }
-            if origin.domain != None && url.domain != origin.domain {
+            if origin.domain.is_some() && url.domain != origin.domain {
                 // no direct match for domain, look for  partial patterns (e.g. "*.domain.com")
                 if let (Some(origin_domain), Some(domain)) = (&origin.domain, &url.domain) {
                     if origin_domain.starts_with('*')
@@ -156,12 +159,16 @@ pub fn matches_any_origin(url: Option<&str>, origins: &[SchemeDomainPort]) -> bo
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use relay_general::protocol::Csp;
     use relay_general::types::Annotated;
 
-    fn get_csp_event(blocked_uri: Option<&str>, source_file: Option<&str>) -> Event {
+    use super::*;
+
+    fn get_csp_event(
+        blocked_uri: Option<&str>,
+        source_file: Option<&str>,
+        document_uri: Option<&str>,
+    ) -> Event {
         fn annotated_string_or_none(val: Option<&str>) -> Annotated<String> {
             match val {
                 None => Annotated::empty(),
@@ -173,6 +180,7 @@ mod tests {
             csp: Annotated::from(Csp {
                 blocked_uri: annotated_string_or_none(blocked_uri),
                 source_file: annotated_string_or_none(source_file),
+                document_uri: annotated_string_or_none(document_uri),
                 ..Csp::default()
             }),
             ..Event::default()
@@ -285,6 +293,12 @@ mod tests {
             ),
             // this used to crash
             ("http://y:80", vec!["http://x"], false),
+            // starts on both ends
+            (
+                "https://abc.software.example.com",
+                vec!["*abc.software.example.com*"],
+                false,
+            ),
         ];
 
         for (url, origins, expected) in examples {
@@ -293,13 +307,13 @@ mod tests {
                 .map(|url| SchemeDomainPort::from(*url))
                 .collect();
             let actual = matches_any_origin(Some(*url), &origins[..]);
-            assert_eq!(*expected, actual, "Could not match {}.", url);
+            assert_eq!(*expected, actual, "Could not match {url}.");
         }
     }
 
     #[test]
     fn test_filters_known_blocked_source_files() {
-        let event = get_csp_event(None, Some("http://known.bad.com"));
+        let event = get_csp_event(None, Some("http://known.bad.com"), None);
         let config = CspFilterConfig {
             disallowed_sources: vec!["http://known.bad.com".to_string()],
         };
@@ -314,7 +328,7 @@ mod tests {
 
     #[test]
     fn test_does_not_filter_benign_source_files() {
-        let event = get_csp_event(None, Some("http://good.file.com"));
+        let event = get_csp_event(None, Some("http://good.file.com"), None);
         let config = CspFilterConfig {
             disallowed_sources: vec!["http://known.bad.com".to_string()],
         };
@@ -328,8 +342,23 @@ mod tests {
     }
 
     #[test]
+    fn test_filters_known_document_uris() {
+        let event = get_csp_event(None, None, Some("http://known.bad.com"));
+        let config = CspFilterConfig {
+            disallowed_sources: vec!["http://known.bad.com".to_string()],
+        };
+
+        let actual = should_filter(&event, &config);
+        assert_ne!(
+            actual,
+            Ok(()),
+            "CSP filter should have filtered known document uri"
+        );
+    }
+
+    #[test]
     fn test_filters_known_blocked_uris() {
-        let event = get_csp_event(Some("http://known.bad.com"), None);
+        let event = get_csp_event(Some("http://known.bad.com"), None, None);
         let config = CspFilterConfig {
             disallowed_sources: vec!["http://known.bad.com".to_string()],
         };
@@ -344,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_does_not_filter_benign_uris() {
-        let event = get_csp_event(Some("http://good.file.com"), None);
+        let event = get_csp_event(Some("http://good.file.com"), None, None);
         let config = CspFilterConfig {
             disallowed_sources: vec!["http://known.bad.com".to_string()],
         };
@@ -359,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_does_not_filter_non_csp_messages() {
-        let mut event = get_csp_event(Some("http://known.bad.com"), None);
+        let mut event = get_csp_event(Some("http://known.bad.com"), None, None);
         event.ty = Annotated::from(EventType::Transaction);
         let config = CspFilterConfig {
             disallowed_sources: vec!["http://known.bad.com".to_string()],
@@ -400,7 +429,7 @@ mod tests {
         ];
 
         for (blocked_uri, source_file) in examples {
-            let event = get_csp_event(*blocked_uri, *source_file);
+            let event = get_csp_event(*blocked_uri, *source_file, None);
             let config = CspFilterConfig {
                 disallowed_sources: get_disallowed_sources(),
             };
@@ -409,9 +438,7 @@ mod tests {
             assert_ne!(
                 actual,
                 Ok(()),
-                "CSP filter should have filtered  bad request {:?} {:?}",
-                blocked_uri,
-                source_file
+                "CSP filter should have filtered  bad request {blocked_uri:?} {source_file:?}"
             );
         }
     }
@@ -425,7 +452,7 @@ mod tests {
         ];
 
         for (blocked_uri, source_file) in examples {
-            let event = get_csp_event(*blocked_uri, *source_file);
+            let event = get_csp_event(*blocked_uri, *source_file, None);
             let config = CspFilterConfig {
                 disallowed_sources: get_disallowed_sources(),
             };
@@ -434,9 +461,7 @@ mod tests {
             assert_eq!(
                 actual,
                 Ok(()),
-                "CSP filter should have  NOT filtered  request {:?} {:?}",
-                blocked_uri,
-                source_file
+                "CSP filter should have  NOT filtered  request {blocked_uri:?} {source_file:?}"
             );
         }
     }

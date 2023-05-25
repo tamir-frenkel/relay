@@ -1,23 +1,15 @@
-use actix_web::actix::*;
-use actix_web::http::StatusCode;
-use actix_web::{Error, FromRequest, HttpMessage, HttpRequest, HttpResponse, ResponseError};
-use failure::Fail;
-use futures::prelude::*;
+use axum::extract::rejection::BytesRejection;
+use axum::extract::FromRequest;
+use axum::http::{Request, StatusCode};
+use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
+use relay_auth::{RelayId, UnpackError};
+use relay_config::RelayInfo;
 use serde::de::DeserializeOwned;
 
-use relay_auth::{RelayId, UnpackError};
-use relay_common::tryf;
-use relay_config::RelayInfo;
-use relay_log::Hub;
-
-use crate::actors::relays::{GetRelay, RelayCache};
-use crate::body::RequestBody;
-use crate::middlewares::ActixWebHubExt;
+use crate::actors::relays::GetRelay;
 use crate::service::ServiceState;
 use crate::utils::ApiErrorResponse;
-
-/// Maximum size of a JSON request body.
-const MAX_JSON_SIZE: usize = 262_144;
 
 #[derive(Debug)]
 pub struct SignedJson<T> {
@@ -25,28 +17,34 @@ pub struct SignedJson<T> {
     pub relay: RelayInfo,
 }
 
-#[derive(Fail, Debug)]
-enum SignatureError {
-    #[fail(display = "invalid relay signature")]
-    BadSignature(#[cause] UnpackError),
-    #[fail(display = "missing header: {}", _0)]
+#[derive(Debug, thiserror::Error)]
+pub enum SignatureError {
+    #[error("invalid relay signature")]
+    BadSignature(#[source] UnpackError),
+    #[error("missing header: {0}")]
     MissingHeader(&'static str),
-    #[fail(display = "malformed header: {}", _0)]
+    #[error("malformed header: {0}")]
     MalformedHeader(&'static str),
-    #[fail(display = "Unknown relay id")]
+    #[error("unknown relay id")]
     UnknownRelay,
-    #[fail(display = "invalid JSON data")]
-    InvalidJson(#[cause] serde_json::Error),
+    #[error(transparent)]
+    MalformedBody(#[from] BytesRejection),
+    #[error("invalid JSON data")]
+    InvalidJson(#[from] serde_json::Error),
+    #[error("internal system is overloaded")]
+    ServiceUnavailable(#[from] relay_system::SendError),
 }
 
-impl ResponseError for SignatureError {
-    fn error_response(&self) -> HttpResponse {
+impl IntoResponse for SignatureError {
+    fn into_response(self) -> Response {
         let status = match self {
             SignatureError::InvalidJson(_) => StatusCode::BAD_REQUEST,
+            SignatureError::MalformedBody(_) => StatusCode::BAD_REQUEST,
+            SignatureError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::UNAUTHORIZED,
         };
 
-        HttpResponse::build(status).json(&ApiErrorResponse::from_fail(self))
+        (status, ApiErrorResponse::from_error(&self)).into_response()
     }
 }
 
@@ -59,51 +57,51 @@ impl From<UnpackError> for SignatureError {
     }
 }
 
-impl<T: DeserializeOwned + 'static> FromRequest<ServiceState> for SignedJson<T> {
-    type Config = ();
-    type Result = ResponseFuture<Self, Error>;
+fn get_header<'a, B>(
+    request: &'a Request<B>,
+    name: &'static str,
+) -> Result<&'a str, SignatureError> {
+    let value = request
+        .headers()
+        .get(name)
+        .ok_or(SignatureError::MissingHeader(name))?;
 
-    fn from_request(req: &HttpRequest<ServiceState>, _cfg: &Self::Config) -> Self::Result {
-        macro_rules! extract_header {
-            ($name:expr) => {
-                tryf!(req
-                    .headers()
-                    .get($name)
-                    .ok_or(SignatureError::MissingHeader($name))
-                    .and_then(|value| value
-                        .to_str()
-                        .map_err(|_| SignatureError::MalformedHeader($name))))
-            };
-        }
+    value
+        .to_str()
+        .map_err(|_| SignatureError::MalformedHeader(name))
+}
 
-        let relay_id: RelayId = tryf!(extract_header!("X-Sentry-Relay-Id")
-            .parse()
-            .map_err(|_| SignatureError::MalformedHeader("X-Sentry-Relay-Id")));
+#[axum::async_trait]
+impl<T, B> FromRequest<ServiceState, B> for SignedJson<T>
+where
+    T: DeserializeOwned,
+    B: axum::body::HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<axum::BoxError>,
+{
+    type Rejection = SignatureError;
 
-        Hub::from_request(req).configure_scope(|scope| {
-            // Dump out header value even if not string
-            scope.set_tag("relay_id", relay_id.to_string());
-        });
+    async fn from_request(
+        request: Request<B>,
+        state: &ServiceState,
+    ) -> Result<Self, Self::Rejection> {
+        let relay_id = get_header(&request, "x-sentry-relay-id")?
+            .parse::<RelayId>()
+            .map_err(|_| SignatureError::MalformedHeader("x-sentry-relay-id"))?;
 
-        let relay_sig = extract_header!("X-Sentry-Relay-Signature").to_owned();
+        // Track the relay header value even if is not a string.
+        relay_log::configure_scope(|s| s.set_tag("relay_id", relay_id.to_string()));
 
-        let future = RelayCache::from_registry()
+        let signature = get_header(&request, "x-sentry-relay-signature")?.to_owned();
+
+        let relay = state
+            .relay_cache()
             .send(GetRelay { relay_id })
-            .map_err(Error::from)
-            .and_then(|result| {
-                result?
-                    .relay
-                    .ok_or_else(|| Error::from(SignatureError::UnknownRelay))
-            })
-            .join(RequestBody::new(req, MAX_JSON_SIZE).map_err(Error::from))
-            .and_then(move |(relay, body)| {
-                relay
-                    .public_key
-                    .unpack(&body, &relay_sig, None)
-                    .map(|inner| SignedJson { inner, relay })
-                    .map_err(|e| Error::from(SignatureError::from(e)))
-            });
+            .await?
+            .ok_or(SignatureError::UnknownRelay)?;
 
-        Box::new(future)
+        let body = Bytes::from_request(request, state).await?;
+        let inner = relay.public_key.unpack(&body, &signature, None)?;
+        Ok(SignedJson { inner, relay })
     }
 }

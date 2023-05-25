@@ -86,12 +86,6 @@ pub enum MetricHistograms {
     /// equivalent to the number of projects being flushed.
     BucketsFlushedPerProject,
 
-    /// The number of metric elements in the bucket.
-    ///
-    /// BucketRelativeSize measures how many distinct values are in a bucket and therefore
-    /// BucketRelativeSize gives you a measurement of the bucket size and complexity.
-    BucketRelativeSize,
-
     /// The reporting delay at which a bucket arrives in Relay.
     ///
     /// A positive delay indicates the bucket arrives after its stated timestamp. Large delays
@@ -103,6 +97,25 @@ pub enum MetricHistograms {
     ///  - `backdated`: A flag indicating whether the metric was reported within the `initial_delay`
     ///    time period (`false`) or after the initial delay has expired (`true`).
     BucketsDelay,
+
+    /// The number of batches emitted per partition by [`crate::aggregation::Aggregator`].
+    BatchesPerPartition,
+
+    /// The number of buckets in a batch emitted by [`crate::aggregation::Aggregator`].
+    ///
+    /// This corresponds to the number of buckets that will end up in an envelope.
+    BucketsPerBatch,
+
+    /// Distribution of flush buckets over partition keys.
+    ///
+    /// The distribution of buckets should be even.
+    /// If it is not, this metric should expose it.
+    PartitionKeys,
+
+    /// Distribution of invalid bucket timestamps observed, relative to the time of observation.
+    ///
+    /// This is a temporary metric to better understand why we see so many invalid timestamp errors.
+    InvalidBucketTimestamp,
 }
 
 impl HistogramMetric for MetricHistograms {
@@ -110,8 +123,11 @@ impl HistogramMetric for MetricHistograms {
         match *self {
             Self::BucketsFlushed => "metrics.buckets.flushed",
             Self::BucketsFlushedPerProject => "metrics.buckets.flushed_per_project",
-            Self::BucketRelativeSize => "metrics.buckets.relative_bucket_size",
             Self::BucketsDelay => "metrics.buckets.delay",
+            Self::BatchesPerPartition => "metrics.buckets.batches_per_partition",
+            Self::BucketsPerBatch => "metrics.buckets.per_batch",
+            Self::PartitionKeys => "metrics.buckets.partition_keys",
+            Self::InvalidBucketTimestamp => "metrics.buckets.invalid_timestamp",
         }
     }
 }
@@ -120,12 +136,43 @@ impl HistogramMetric for MetricHistograms {
 pub enum MetricGauges {
     /// The total number of metric buckets in Relay's metrics aggregator.
     Buckets,
+    /// The total storage cost of metric buckets in Relay's metrics aggregator.
+    BucketsCost,
 }
 
 impl GaugeMetric for MetricGauges {
     fn name(&self) -> &'static str {
         match *self {
             Self::Buckets => "metrics.buckets",
+            Self::BucketsCost => "metrics.buckets.cost",
         }
     }
+}
+
+/// Returns a low-cardinality metric name for use as a tag key on statsd metrics.
+///
+/// In order to keep this low-cardinality, we only enumerate a handful of well-known, high volume
+/// names. The rest gets mapped to "other".
+pub fn metric_name_tag(value: &str) -> &str {
+    if [
+        "c:sessions/session@none",
+        "s:sessions/user@none",
+        "s:sessions/error@none",
+        "d:transactions/duration@millisecond",
+        "s:transactions/user@none",
+        "c:transactions/count_per_root_project@none",
+    ]
+    .contains(&value)
+    {
+        return value;
+    }
+
+    if value.starts_with("d:transactions/breakdowns.") {
+        return "d:transactions/breakdowns.*";
+    }
+    if value.starts_with("d:transactions/measurements.") {
+        return "d:transactions/measurements.*";
+    }
+
+    "other"
 }

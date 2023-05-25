@@ -34,42 +34,42 @@ use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Write};
+use std::time::Instant;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use failure::Fail;
-use relay_common::UnixTimestamp;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use smallvec::SmallVec;
-
+use relay_common::{DataCategory, UnixTimestamp};
+use relay_dynamic_config::ErrorBoundary;
 use relay_general::protocol::{EventId, EventType};
 use relay_general::types::Value;
-use relay_sampling::TraceContext;
+use relay_sampling::DynamicSamplingContext;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::constants::DEFAULT_EVENT_RETENTION;
 use crate::extractors::{PartialMeta, RequestMeta};
-use crate::utils::ErrorBoundary;
 
 pub const CONTENT_TYPE: &str = "application/x-sentry-envelope";
 
-#[derive(Debug, Fail)]
+#[derive(Debug, thiserror::Error)]
 pub enum EnvelopeError {
-    #[fail(display = "unexpected end of file")]
+    #[error("unexpected end of file")]
     UnexpectedEof,
-    #[fail(display = "missing envelope header")]
+    #[error("missing envelope header")]
     MissingHeader,
-    #[fail(display = "missing newline after header or payload")]
+    #[error("missing newline after header or payload")]
     MissingNewline,
-    #[fail(display = "invalid envelope header")]
-    InvalidHeader(#[cause] serde_json::Error),
-    #[fail(display = "{} header mismatch between envelope and request", _0)]
+    #[error("invalid envelope header")]
+    InvalidHeader(#[source] serde_json::Error),
+    #[error("{0} header mismatch between envelope and request")]
     HeaderMismatch(&'static str),
-    #[fail(display = "invalid item header")]
-    InvalidItemHeader(#[cause] serde_json::Error),
-    #[fail(display = "failed to write header")]
-    HeaderIoFailed(#[cause] serde_json::Error),
-    #[fail(display = "failed to write payload")]
-    PayloadIoFailed(#[cause] io::Error),
+    #[error("invalid item header")]
+    InvalidItemHeader(#[source] serde_json::Error),
+    #[error("failed to write header")]
+    HeaderIoFailed(#[source] serde_json::Error),
+    #[error("failed to write payload")]
+    PayloadIoFailed(#[source] io::Error),
 }
 
 /// The type of an envelope item.
@@ -101,8 +101,14 @@ pub enum ItemType {
     MetricBuckets,
     /// Client internal report (eg: outcomes).
     ClientReport,
-    /// Profile event payload encoded in JSON
+    /// Profile event payload encoded as JSON.
     Profile,
+    /// Replay metadata and breadcrumb payload.
+    ReplayEvent,
+    /// Replay Recording data.
+    ReplayRecording,
+    /// Monitor check-in encoded as JSON.
+    CheckIn,
     /// A new item type that is yet unknown by this version of Relay.
     ///
     /// By default, items of this type are forwarded without modification. Processing Relays and
@@ -142,6 +148,9 @@ impl fmt::Display for ItemType {
             Self::MetricBuckets => write!(f, "metric_buckets"),
             Self::ClientReport => write!(f, "client_report"),
             Self::Profile => write!(f, "profile"),
+            Self::ReplayEvent => write!(f, "replay_event"),
+            Self::ReplayRecording => write!(f, "replay_recording"),
+            Self::CheckIn => write!(f, "check_in"),
             Self::Unknown(s) => s.fmt(f),
         }
     }
@@ -166,6 +175,9 @@ impl std::str::FromStr for ItemType {
             "metric_buckets" => Self::MetricBuckets,
             "client_report" => Self::ClientReport,
             "profile" => Self::Profile,
+            "replay_event" => Self::ReplayEvent,
+            "replay_recording" => Self::ReplayRecording,
+            "check_in" => Self::CheckIn,
             other => Self::Unknown(other.to_owned()),
         })
     }
@@ -313,24 +325,20 @@ relay_common::impl_str_de!(ContentType, "a content type string");
 /// The type of an event attachment.
 ///
 /// These item types must align with the Sentry processing pipeline.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AttachmentType {
     /// A regular attachment without special meaning.
-    #[serde(rename = "event.attachment")]
     Attachment,
 
     /// A minidump crash report (binary data).
-    #[serde(rename = "event.minidump")]
     Minidump,
 
     /// An apple crash report (text data).
-    #[serde(rename = "event.applecrashreport")]
     AppleCrashReport,
 
     /// A msgpack-encoded event payload submitted as part of multipart uploads.
     ///
     /// This attachment is processed by Relay immediately and never forwarded or persisted.
-    #[serde(rename = "event.payload")]
     EventPayload,
 
     /// A msgpack-encoded list of payloads.
@@ -339,7 +347,6 @@ pub enum AttachmentType {
     /// will be merged and truncated to the maxmimum number of allowed attachments.
     ///
     /// This attachment is processed by Relay immediately and never forwarded or persisted.
-    #[serde(rename = "event.breadcrumbs")]
     Breadcrumbs,
 
     /// This is a binary attachment present in Unreal 4 events containing event context information.
@@ -348,7 +355,6 @@ pub enum AttachmentType {
     /// [`symbolic_unreal::Unreal4Context`].
     ///
     /// [`symbolic_unreal::Unreal4Context`]: https://docs.rs/symbolic/*/symbolic/unreal/struct.Unreal4Context.html
-    #[serde(rename = "unreal.context")]
     UnrealContext,
 
     /// This is a binary attachment present in Unreal 4 events containing event Logs.
@@ -357,8 +363,14 @@ pub enum AttachmentType {
     /// [`symbolic_unreal::Unreal4LogEntry`].
     ///
     /// [`symbolic_unreal::Unreal4LogEntry`]: https://docs.rs/symbolic/*/symbolic/unreal/struct.Unreal4LogEntry.html
-    #[serde(rename = "unreal.logs")]
     UnrealLogs,
+
+    /// An application UI view hierarchy (json payload).
+    ViewHierarchy,
+
+    /// Unknown attachment type, forwarded for compatibility.
+    /// Attachments with this type will be dropped if `accept_unknown_items` is set to false.
+    Unknown(String),
 }
 
 impl Default for AttachmentType {
@@ -366,6 +378,45 @@ impl Default for AttachmentType {
         Self::Attachment
     }
 }
+
+impl fmt::Display for AttachmentType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AttachmentType::Attachment => write!(f, "event.attachment"),
+            AttachmentType::Minidump => write!(f, "event.minidump"),
+            AttachmentType::AppleCrashReport => write!(f, "event.applecrashreport"),
+            AttachmentType::EventPayload => write!(f, "event.payload"),
+            AttachmentType::Breadcrumbs => write!(f, "event.breadcrumbs"),
+            AttachmentType::UnrealContext => write!(f, "unreal.context"),
+            AttachmentType::UnrealLogs => write!(f, "unreal.logs"),
+            AttachmentType::ViewHierarchy => write!(f, "event.view_hierarchy"),
+            AttachmentType::Unknown(s) => s.fmt(f),
+        }
+    }
+}
+
+impl std::str::FromStr for AttachmentType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "event.attachment" => AttachmentType::Attachment,
+            "event.minidump" => AttachmentType::Minidump,
+            "event.applecrashreport" => AttachmentType::AppleCrashReport,
+            "event.payload" => AttachmentType::EventPayload,
+            "event.breadcrumbs" => AttachmentType::Breadcrumbs,
+            "event.view_hierarchy" => AttachmentType::ViewHierarchy,
+            "unreal.context" => AttachmentType::UnrealContext,
+            "unreal.logs" => AttachmentType::UnrealLogs,
+            other => AttachmentType::Unknown(other.to_owned()),
+        })
+    }
+}
+
+relay_common::impl_str_serde!(
+    AttachmentType,
+    "an attachment type (see sentry develop docs)"
+);
 
 fn is_false(val: &bool) -> bool {
     !*val
@@ -421,14 +472,21 @@ pub struct ItemHeaders {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timestamp: Option<UnixTimestamp>,
 
-    /// Flag indicating if metrics have already been extracted from the item
+    /// Flag indicating if metrics have already been extracted from the item.
     ///
     /// In order to only extract metrics once from an item while through a
     /// chain of Relays, a Relay that extracts metrics from an item (typically
-    /// the first Relay) MUST set this flat to true so that downstream Relays do
+    /// the first Relay) MUST set this flat to true so that upstream Relays do
     /// not extract the metric again causing double counting of the metric.
     #[serde(default, skip_serializing_if = "is_false")]
     metrics_extracted: bool,
+
+    /// Internal flag to signal that the profile has been counted toward `DataCategory::Profile`.
+    ///
+    /// If `true`, outcomes for this item should be reported as `DataCategory::ProfileIndexed`
+    /// instead.
+    #[serde(skip)]
+    profile_counted_as_processed: bool,
 
     /// Other attributes for forward compatibility.
     #[serde(flatten)]
@@ -456,6 +514,7 @@ impl Item {
                 timestamp: None,
                 other: BTreeMap::new(),
                 metrics_extracted: false,
+                profile_counted_as_processed: false,
             },
             payload: Bytes::new(),
         }
@@ -471,6 +530,48 @@ impl Item {
         self.payload.len()
     }
 
+    /// Returns the number used for counting towards rate limits and producing outcomes.
+    ///
+    /// For attachments, we count the number of bytes. Other items are counted as 1.
+    pub fn quantity(&self) -> usize {
+        match self.ty() {
+            ItemType::Attachment => self.len().max(1),
+            _ => 1,
+        }
+    }
+
+    /// Returns the data category used for generating outcomes.
+    ///
+    /// Returns `None` if outcomes are not generated for this type (e.g. sessions).
+    pub fn outcome_category(&self, indexed: bool) -> Option<DataCategory> {
+        match self.ty() {
+            ItemType::Event => Some(DataCategory::Error),
+            ItemType::Transaction => Some(if indexed {
+                DataCategory::TransactionIndexed
+            } else {
+                DataCategory::Transaction
+            }),
+            ItemType::Security | ItemType::RawSecurity => Some(DataCategory::Security),
+            ItemType::UnrealReport => Some(DataCategory::Error),
+            ItemType::Attachment => Some(DataCategory::Attachment),
+            ItemType::Session | ItemType::Sessions => None,
+            ItemType::Metrics | ItemType::MetricBuckets => None,
+            ItemType::FormData => None,
+            ItemType::UserReport => None,
+            // For profiles, do not used the `indexed` flag, because it depends
+            // on whether metrics were extracted from the _event_.
+            ItemType::Profile => Some(if self.headers.profile_counted_as_processed {
+                DataCategory::ProfileIndexed
+            } else {
+                DataCategory::Profile
+            }),
+            ItemType::ReplayEvent | ItemType::ReplayRecording => Some(DataCategory::Replay),
+            ItemType::ClientReport => None,
+            ItemType::CheckIn => Some(DataCategory::Monitor),
+            ItemType::Unknown(_) => None,
+        }
+    }
+
     /// Returns `true` if this item's payload is empty.
     pub fn is_empty(&self) -> bool {
         self.payload.is_empty()
@@ -483,9 +584,9 @@ impl Item {
     }
 
     /// Returns the attachment type if this item is an attachment.
-    pub fn attachment_type(&self) -> Option<AttachmentType> {
+    pub fn attachment_type(&self) -> Option<&AttachmentType> {
         // TODO: consider to replace this with an ItemType?
-        self.headers.attachment_type
+        self.headers.attachment_type.as_ref()
     }
 
     /// Sets the attachment type of this item.
@@ -562,6 +663,21 @@ impl Item {
         self.headers.metrics_extracted
     }
 
+    /// Returns `true` if the profiles in the envelope have been counted towards `DataCategory::Profile`.
+    ///
+    /// If so, count them towards `DataCategory::ProfileIndexed` instead.
+    pub fn profile_counted_as_processed(&self) -> bool {
+        self.headers.profile_counted_as_processed
+    }
+
+    /// Mark the item as "counted towards `DataCategory::Profile`".
+    #[cfg(feature = "processing")]
+    pub fn set_profile_counted_as_processed(&mut self) {
+        if self.ty() == &ItemType::Profile {
+            self.headers.profile_counted_as_processed = true;
+        }
+    }
+
     /// Sets the metrics extracted flag.
     pub fn set_metrics_extracted(&mut self, metrics_extracted: bool) {
         self.headers.metrics_extracted = metrics_extracted;
@@ -599,15 +715,22 @@ impl Item {
 
             // Attachments are only event items if they are crash reports or if they carry partial
             // event payloads. Plain attachments never create event payloads.
-            ItemType::Attachment => match self.attachment_type().unwrap_or_default() {
-                AttachmentType::AppleCrashReport
-                | AttachmentType::Minidump
-                | AttachmentType::EventPayload
-                | AttachmentType::Breadcrumbs => true,
-                AttachmentType::Attachment
-                | AttachmentType::UnrealContext
-                | AttachmentType::UnrealLogs => false,
-            },
+            ItemType::Attachment => {
+                match self.attachment_type().unwrap_or(&AttachmentType::default()) {
+                    AttachmentType::AppleCrashReport
+                    | AttachmentType::Minidump
+                    | AttachmentType::EventPayload
+                    | AttachmentType::Breadcrumbs => true,
+                    AttachmentType::Attachment
+                    | AttachmentType::UnrealContext
+                    | AttachmentType::UnrealLogs
+                    | AttachmentType::ViewHierarchy => false,
+                    // When an outdated Relay instance forwards an unknown attachment type for compatibility,
+                    // we assume that the attachment does not create a new event. This will make it hard
+                    // to introduce new attachment types which _do_ create a new event.
+                    AttachmentType::Unknown(_) => false,
+                }
+            }
 
             // Form data items may contain partial event payloads, but those are only ever valid if
             // they occur together with an explicit event item, such as a minidump or apple crash
@@ -621,7 +744,10 @@ impl Item {
             | ItemType::Metrics
             | ItemType::MetricBuckets
             | ItemType::ClientReport
-            | ItemType::Profile => false,
+            | ItemType::ReplayEvent
+            | ItemType::ReplayRecording
+            | ItemType::Profile
+            | ItemType::CheckIn => false,
 
             // The unknown item type can observe any behavior, most likely there are going to be no
             // item types added that create events.
@@ -642,12 +768,15 @@ impl Item {
             ItemType::RawSecurity => true,
             ItemType::UnrealReport => true,
             ItemType::UserReport => true,
+            ItemType::ReplayEvent => true,
             ItemType::Session => false,
             ItemType::Sessions => false,
             ItemType::Metrics => false,
             ItemType::MetricBuckets => false,
             ItemType::ClientReport => false,
+            ItemType::ReplayRecording => false,
             ItemType::Profile => true,
+            ItemType::CheckIn => false,
 
             // Since this Relay cannot interpret the semantics of this item, it does not know
             // whether it requires an event or not. Depending on the strategy, this can cause two
@@ -698,7 +827,7 @@ pub struct EnvelopeHeaders<M = RequestMeta> {
 
     /// Trace context associated with the request
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    trace: Option<ErrorBoundary<TraceContext>>,
+    trace: Option<ErrorBoundary<DynamicSamplingContext>>,
 
     /// Other attributes for forward compatibility.
     #[serde(flatten)]
@@ -753,8 +882,8 @@ pub struct Envelope {
 
 impl Envelope {
     /// Creates an envelope from request information.
-    pub fn from_request(event_id: Option<EventId>, meta: RequestMeta) -> Self {
-        Self {
+    pub fn from_request(event_id: Option<EventId>, meta: RequestMeta) -> Box<Self> {
+        Box::new(Self {
             headers: EnvelopeHeaders {
                 event_id,
                 meta,
@@ -764,16 +893,16 @@ impl Envelope {
                 trace: None,
             },
             items: Items::new(),
-        }
+        })
     }
 
     /// Parses an envelope from bytes.
     #[allow(dead_code)]
-    pub fn parse_bytes(bytes: Bytes) -> Result<Self, EnvelopeError> {
+    pub fn parse_bytes(bytes: Bytes) -> Result<Box<Self>, EnvelopeError> {
         let (headers, offset) = Self::parse_headers(&bytes)?;
         let items = Self::parse_items(&bytes, offset)?;
 
-        Ok(Envelope { headers, items })
+        Ok(Box::new(Envelope { headers, items }))
     }
 
     /// Parses an envelope taking into account a request.
@@ -782,7 +911,10 @@ impl Envelope {
     /// request. It validates that request headers are in line with the envelope's headers.
     ///
     /// If no event id is provided explicitly, one is created on the fly.
-    pub fn parse_request(bytes: Bytes, request_meta: RequestMeta) -> Result<Self, EnvelopeError> {
+    pub fn parse_request(
+        bytes: Bytes,
+        request_meta: RequestMeta,
+    ) -> Result<Box<Self>, EnvelopeError> {
         let (partial_headers, offset) = Self::parse_headers::<PartialMeta>(&bytes)?;
         let mut headers = partial_headers.complete(request_meta)?;
 
@@ -792,7 +924,16 @@ impl Envelope {
             headers.event_id.get_or_insert_with(EventId::new);
         }
 
-        Ok(Envelope { headers, items })
+        Ok(Box::new(Envelope { headers, items }))
+    }
+
+    /// Move the envelope's items into an envelope with the same headers.
+    pub fn take_items(&mut self) -> Envelope {
+        let Self { headers, items } = self;
+        Self {
+            headers: headers.clone(),
+            items: std::mem::take(items),
+        }
     }
 
     /// Returns the number of items in this envelope.
@@ -845,9 +986,31 @@ impl Envelope {
         self.headers.sent_at = Some(sent_at);
     }
 
+    /// Sets the start time to the provided `Instant`.
+    pub fn set_start_time(&mut self, start_time: Instant) {
+        self.headers.meta.set_start_time(start_time)
+    }
+
     /// Sets the data retention in days for items in this envelope.
     pub fn set_retention(&mut self, retention: u16) {
         self.headers.retention = Some(retention);
+    }
+
+    /// Returns the dynamic sampling context from envelope headers, if present.
+    pub fn dsc(&self) -> Option<&DynamicSamplingContext> {
+        match &self.headers.trace {
+            None => None,
+            Some(ErrorBoundary::Err(e)) => {
+                relay_log::debug!("failed to parse sampling context: {:?}", e);
+                None
+            }
+            Some(ErrorBoundary::Ok(t)) => Some(t),
+        }
+    }
+
+    /// Overrides the dynamic sampling context in envelope headers.
+    pub fn set_dsc(&mut self, dsc: DynamicSamplingContext) {
+        self.headers.trace = Some(ErrorBoundary::Ok(dsc));
     }
 
     /// Returns the specified header value, if present.
@@ -922,7 +1085,7 @@ impl Envelope {
     /// with all items that return `true`. Items that return `false` remain in this envelope.
     ///
     /// The returned envelope assumes the same headers.
-    pub fn split_by<F>(&mut self, mut f: F) -> Option<Self>
+    pub fn split_by<F>(&mut self, mut f: F) -> Option<Box<Self>>
     where
         F: FnMut(&Item) -> bool,
     {
@@ -935,18 +1098,10 @@ impl Envelope {
         let (split_items, own_items) = old_items.into_iter().partition(f);
         self.items = own_items;
 
-        Some(Envelope {
+        Some(Box::new(Envelope {
             headers: self.headers.clone(),
             items: split_items,
-        })
-    }
-
-    pub fn trace_context(&self) -> Option<&TraceContext> {
-        match &self.headers.trace {
-            Option::None => None,
-            Option::Some(ErrorBoundary::Err(_)) => None,
-            Option::Some(ErrorBoundary::Ok(t)) => Some(t),
-        }
+        }))
     }
 
     /// Retains only the items specified by the predicate.
@@ -1009,7 +1164,7 @@ impl Envelope {
         let mut items = Items::new();
 
         while offset < bytes.len() {
-            let (item, item_size) = Self::parse_item(bytes.slice_from(offset))?;
+            let (item, item_size) = Self::parse_item(bytes.slice(offset..))?;
             offset += item_size;
             items.push(item);
         }
@@ -1052,7 +1207,7 @@ impl Envelope {
             },
         };
 
-        let payload = bytes.slice(payload_start, payload_end);
+        let payload = bytes.slice(payload_start..payload_end);
         let item = Item { headers, payload };
 
         Ok((item, payload_end + 1))
@@ -1077,9 +1232,9 @@ impl Envelope {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use relay_common::ProjectId;
+
+    use super::*;
 
     fn request_meta() -> RequestMeta {
         let dsn = "https://e12d836b15bb49d7bbf99e64295d995b:@sentry.io/42"
@@ -1239,7 +1394,7 @@ mod tests {
 
     #[test]
     fn test_deserialize_envelope_empty_item_eof() {
-        // With terminating newline after item payload
+        // Without terminating newline after item payload
         let bytes = Bytes::from(
             "\
              {\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"dsn\":\"https://e12d836b15bb49d7bbf99e64295d995b:@sentry.io/42\"}\n\
@@ -1361,6 +1516,42 @@ mod tests {
 
         let items: Vec<_> = envelope.items().collect();
         assert_eq!(items[0].len(), 10);
+    }
+
+    #[test]
+    fn test_deserialize_envelope_replay_recording() {
+        let bytes = Bytes::from(
+            "\
+             {\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"dsn\":\"https://e12d836b15bb49d7bbf99e64295d995b:@sentry.io/42\"}\n\
+             {\"type\":\"replay_recording\"}\n\
+             helloworld\n\
+             ",
+        );
+
+        let envelope = Envelope::parse_bytes(bytes).unwrap();
+        assert_eq!(envelope.len(), 1);
+        let items: Vec<_> = envelope.items().collect();
+        assert_eq!(items[0].ty(), &ItemType::ReplayRecording);
+    }
+
+    #[test]
+    fn test_deserialize_envelope_view_hierarchy() {
+        let bytes = Bytes::from(
+            "\
+             {\"event_id\":\"9ec79c33ec9942ab8353589fcb2e04dc\",\"dsn\":\"https://e12d836b15bb49d7bbf99e64295d995b:@sentry.io/42\"}\n\
+             {\"type\":\"attachment\",\"length\":44,\"content_type\":\"application/json\",\"attachment_type\":\"event.view_hierarchy\"}\n\
+             {\"rendering_system\":\"compose\",\"windows\":[]}\n\
+             ",
+        );
+
+        let envelope = Envelope::parse_bytes(bytes).unwrap();
+        assert_eq!(envelope.len(), 1);
+        let items: Vec<_> = envelope.items().collect();
+        assert_eq!(items[0].ty(), &ItemType::Attachment);
+        assert_eq!(
+            items[0].attachment_type(),
+            Some(&AttachmentType::ViewHierarchy)
+        );
     }
 
     #[test]

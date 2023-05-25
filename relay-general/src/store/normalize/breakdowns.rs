@@ -6,9 +6,8 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
 use relay_common::{DurationUnit, MetricUnit};
+use serde::{Deserialize, Serialize};
 
 use crate::protocol::{Breakdowns, Event, Measurement, Measurements, Timestamp};
 use crate::types::Annotated;
@@ -137,7 +136,7 @@ impl EmitBreakdowns for SpanOperationsConfig {
                 unit: Annotated::new(MetricUnit::Duration(DurationUnit::MilliSecond)),
             };
 
-            let op_breakdown_name = format!("ops.{}", operation_name);
+            let op_breakdown_name = format!("ops.{operation_name}");
             breakdown.insert(op_breakdown_name, Annotated::new(op_value));
         }
 
@@ -233,16 +232,18 @@ pub fn normalize_breakdowns(event: &mut Event, breakdowns_config: &BreakdownsCon
 
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeZone, Timelike, Utc};
+    use similar_asserts::assert_eq;
+
     use super::*;
     use crate::protocol::{EventType, Span, SpanId, SpanStatus, TraceId};
     use crate::types::Object;
-    use chrono::{TimeZone, Utc};
 
     #[test]
     fn test_skip_with_empty_breakdowns_config() {
         let mut event = Event::default();
         normalize_breakdowns(&mut event, &BreakdownsConfig::default());
-        assert_eq_dbg!(event.breakdowns.value(), None);
+        assert_eq!(event.breakdowns.value(), None);
     }
 
     #[test]
@@ -270,7 +271,7 @@ mod tests {
             ..Default::default()
         };
         normalize_breakdowns(&mut event, &BreakdownsConfig::default());
-        assert_eq_dbg!(event.breakdowns.into_value(), None);
+        assert_eq!(event.breakdowns.into_value(), None);
     }
 
     #[test]
@@ -294,29 +295,35 @@ mod tests {
 
         let spans = vec![
             make_span(
-                Annotated::new(Utc.ymd(2020, 1, 1).and_hms_nano(0, 0, 0, 0).into()),
-                Annotated::new(Utc.ymd(2020, 1, 1).and_hms_nano(1, 0, 0, 0).into()),
+                Annotated::new(Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap().into()),
+                Annotated::new(Utc.with_ymd_and_hms(2020, 1, 1, 1, 0, 0).unwrap().into()),
                 "http".to_string(),
             ),
             // overlapping spans
             make_span(
-                Annotated::new(Utc.ymd(2020, 1, 1).and_hms_nano(2, 0, 0, 0).into()),
-                Annotated::new(Utc.ymd(2020, 1, 1).and_hms_nano(3, 0, 0, 0).into()),
+                Annotated::new(Utc.with_ymd_and_hms(2020, 1, 1, 2, 0, 0).unwrap().into()),
+                Annotated::new(Utc.with_ymd_and_hms(2020, 1, 1, 3, 0, 0).unwrap().into()),
                 "db".to_string(),
             ),
             make_span(
-                Annotated::new(Utc.ymd(2020, 1, 1).and_hms_nano(2, 30, 0, 0).into()),
-                Annotated::new(Utc.ymd(2020, 1, 1).and_hms_nano(3, 30, 0, 0).into()),
+                Annotated::new(Utc.with_ymd_and_hms(2020, 1, 1, 2, 30, 0).unwrap().into()),
+                Annotated::new(Utc.with_ymd_and_hms(2020, 1, 1, 3, 30, 0).unwrap().into()),
                 "db.postgres".to_string(),
             ),
             make_span(
-                Annotated::new(Utc.ymd(2020, 1, 1).and_hms_nano(4, 0, 0, 0).into()),
-                Annotated::new(Utc.ymd(2020, 1, 1).and_hms_nano(4, 30, 0, 0).into()),
+                Annotated::new(Utc.with_ymd_and_hms(2020, 1, 1, 4, 0, 0).unwrap().into()),
+                Annotated::new(Utc.with_ymd_and_hms(2020, 1, 1, 4, 30, 0).unwrap().into()),
                 "db.mongo".to_string(),
             ),
             make_span(
-                Annotated::new(Utc.ymd(2020, 1, 1).and_hms_nano(5, 0, 0, 0).into()),
-                Annotated::new(Utc.ymd(2020, 1, 1).and_hms_nano(6, 0, 0, 10_000).into()),
+                Annotated::new(Utc.with_ymd_and_hms(2020, 1, 1, 5, 0, 0).unwrap().into()),
+                Annotated::new(
+                    Utc.with_ymd_and_hms(2020, 1, 1, 6, 0, 0)
+                        .unwrap()
+                        .with_nanosecond(10_000)
+                        .unwrap()
+                        .into(),
+                ),
                 "browser".to_string(),
             ),
         ];
@@ -383,6 +390,6 @@ mod tests {
             breakdowns
         });
 
-        assert_eq_dbg!(event.breakdowns.into_value().unwrap(), expected_breakdowns);
+        assert_eq!(event.breakdowns.into_value().unwrap(), expected_breakdowns);
     }
 }

@@ -4,37 +4,40 @@ authors = ["Sentry <oss@sentry.io>"]
 description = "Error reporting and logging for Relay"
 homepage = "https://getsentry.github.io/relay/"
 repository = "https://github.com/getsentry/relay"
-version = "22.5.0"
-edition = "2018"
+version = "23.5.1"
+edition = "2021"
 license-file = "../LICENSE"
 publish = false
+build = "build.rs"
 
 [dependencies]
-chrono = { version = "0.4.19", optional = true }
-console = { version = "0.10.0", optional = true }
-env_logger = { version = "0.7.1", optional = true }
-failure = "0.1.8"
-log = { version = "0.4.11", features = ["serde"] }
-pretty_env_logger = { version = "0.4.0", optional = true }
+chrono = { version = "0.4.24", optional = true, default-features = false, features = ["clock", "std", "serde"] }
+console = { version = "0.15.5", optional = true }
 relay-crash = { path = "../relay-crash", optional = true }
-sentry = { version = "0.22.0", features = ["debug-images", "log"], optional = true }
-sentry-core = { version = "0.22.0" }
+sentry = { version = "0.30.0", features = ["debug-images", "tower", "tracing"], optional = true }
+sentry-core = { version = "0.30.0" }
 serde = { version = "1.0.114", features = ["derive"], optional = true }
 serde_json = { version = "1.0.55", optional = true }
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.17", features = ["env-filter", "json", "time"], optional = true }
 
 [features]
 default = []
-test = ["env_logger"]
+test = [
+    "dep:tracing-subscriber",
+]
 init = [
-    "chrono",
-    "console",
-    "env_logger",
-    "pretty_env_logger",
-    "sentry",
-    "serde",
-    "serde_json"
+    "dep:chrono",
+    "dep:console",
+    "dep:sentry",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tracing-subscriber",
 ]
 crash-handler = [
     "init",
-    "relay-crash"
+    "dep:relay-crash",
+]
+sentry = [
+    "dep:sentry",
 ]

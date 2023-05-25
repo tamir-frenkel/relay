@@ -10,7 +10,7 @@ from setuptools import setup, find_packages
 from distutils.command.sdist import sdist
 
 
-_version_re = re.compile(r'^version\s*=\s*"(.*?)"\s*$(?m)')
+_version_re = re.compile(r'(?m)^version\s*=\s*"(.*?)"\s*$')
 
 
 DEBUG_BUILD = os.environ.get("RELAY_DEBUG") == "1"
@@ -68,6 +68,10 @@ def build_native(spec):
     else:
         rust_path = ".."
         scratchpad = None
+
+    # if the lib already built we replace the command
+    if os.environ.get("SKIP_RELAY_LIB_BUILD") is not None:
+        cmd = ["echo", "'Use pre-built library.'"]
 
     # Step 1: build the rust library
     build = spec.add_external_build(cmd=cmd, path=rust_path)

@@ -1,12 +1,10 @@
 use std::collections::BTreeMap;
-use std::fmt;
-use std::str;
+use std::{fmt, str};
 
 #[cfg(feature = "jsonschema")]
 use schemars::gen::SchemaGenerator;
 #[cfg(feature = "jsonschema")]
 use schemars::schema::Schema;
-
 use serde::de::{Deserialize, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 
@@ -57,9 +55,9 @@ impl<'a> fmt::Display for ValueDescription<'a> {
         match *self.0 {
             Value::Bool(true) => f.pad("true"),
             Value::Bool(false) => f.pad("false"),
-            Value::I64(val) => write!(f, "integer {}", val),
-            Value::U64(val) => write!(f, "integer {}", val),
-            Value::F64(val) => write!(f, "float {}", val),
+            Value::I64(val) => write!(f, "integer {val}"),
+            Value::U64(val) => write!(f, "integer {val}"),
+            Value::F64(val) => write!(f, "float {val}"),
             Value::String(ref val) => f.pad(val),
             Value::Array(_) => f.pad("an array"),
             Value::Object(_) => f.pad("an object"),

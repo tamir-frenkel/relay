@@ -18,6 +18,7 @@ __all__ = [
     "StoreNormalizer",
     "GeoIpLookup",
     "is_glob_match",
+    "is_codeowners_path_match",
     "parse_release",
     "validate_pii_config",
     "convert_datascrubbing_config",
@@ -26,6 +27,8 @@ __all__ = [
     "VALID_PLATFORMS",
     "validate_sampling_condition",
     "validate_sampling_configuration",
+    "validate_project_config",
+    "run_dynamic_sampling",
 ]
 
 
@@ -50,7 +53,9 @@ _init_valid_platforms()
 
 def split_chunks(string, remarks):
     json_chunks = rustcall(
-        lib.relay_split_chunks, encode_str(string), encode_str(json.dumps(remarks)),
+        lib.relay_split_chunks,
+        encode_str(string),
+        encode_str(json.dumps(remarks)),
     )
     return json.loads(decode_str(json_chunks, free=True))
 
@@ -157,6 +162,14 @@ def is_glob_match(
     return rustcall(lib.relay_is_glob_match, make_buf(value), encode_str(pat), flags)
 
 
+def is_codeowners_path_match(value, pattern):
+    if isinstance(value, text_type):
+        value = value.encode("utf-8")
+    return rustcall(
+        lib.relay_is_codeowners_path_match, make_buf(value), encode_str(pattern)
+    )
+
+
 def validate_pii_config(config):
     """
     Validate a PII config against the schema. Used in project options UI.
@@ -238,3 +251,35 @@ def validate_sampling_configuration(condition):
     error = decode_str(raw_error, free=True)
     if error:
         raise ValueError(error)
+
+
+def validate_project_config(config, strict: bool):
+    """Validate the whole project config.
+
+    :param strict: Whether or not to check for unknown fields.
+    """
+    assert isinstance(config, string_types)
+    raw_error = rustcall(lib.relay_validate_project_config, encode_str(config), strict)
+    error = decode_str(raw_error, free=True)
+    if error:
+        raise ValueError(error)
+
+
+def run_dynamic_sampling(sampling_config, root_sampling_config, dsc, event):
+    """
+    Runs dynamic sampling on an event and returns the merged rules together with the sample rate.
+    """
+    assert isinstance(sampling_config, string_types)
+    assert isinstance(root_sampling_config, string_types)
+    assert isinstance(dsc, string_types)
+    assert isinstance(event, string_types)
+
+    result_json = rustcall(
+        lib.run_dynamic_sampling,
+        encode_str(sampling_config),
+        encode_str(root_sampling_config),
+        encode_str(dsc),
+        encode_str(event),
+    )
+
+    return json.loads(decode_str(result_json, free=True))

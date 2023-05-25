@@ -10,12 +10,11 @@
 #   SENTRY_PROJECT: Project slug
 set -eu
 
-VERSION="${1:-}"
+REVISION="${1:-}"
 GITHUB_PROJECT="getsentry/relay"
-DOCKER_IMAGE="us.gcr.io/sentryio/relay:${VERSION}"
 
-if [ -z "${VERSION}" ]; then
-  echo 'No version specified' && exit 1
+if [ -z "${REVISION}" ]; then
+  echo 'No revision specified' && exit 1
 fi
 
 if [ -z "${SENTRY_AUTH_TOKEN:-}" ]; then
@@ -26,23 +25,26 @@ if [ -z "${SENTRY_ORG:-}" ] || [ -z "${SENTRY_PROJECT:-}" ]; then
   echo 'No SENTRY_ORG or SENTRY_PROJECT provided' && exit 1
 fi
 
-echo 'Pulling debug information from relay image...'
-docker pull "${DOCKER_IMAGE}"
-
-docker run --rm --entrypoint cat "${DOCKER_IMAGE}" /opt/relay-debug.zip > relay-debug.zip
-docker run --rm --entrypoint cat "${DOCKER_IMAGE}" /opt/relay.src.zip > relay.src.zip
-docker run --rm --entrypoint tar "${DOCKER_IMAGE}" -cf - /lib/x86_64-linux-gnu > libs.tar
-tar xf libs.tar
+echo 'Downloading debug info, source bundle, system symbols...'
+gsutil cp \
+  "gs://dicd-team-devinfra-cd--relay/deployment-assets/${REVISION}/release-name" \
+  "gs://dicd-team-devinfra-cd--relay/deployment-assets/${REVISION}/relay-debug.zip" \
+  "gs://dicd-team-devinfra-cd--relay/deployment-assets/${REVISION}/relay.src.zip" \
+  "gs://dicd-team-devinfra-cd--relay/deployment-assets/${REVISION}/libs.tar" \
+  .
 
 echo 'Uploading debug information and source bundle...'
 sentry-cli upload-dif ./relay-debug.zip ./relay.src.zip
 
 echo 'Uploading system symbols...'
+tar xf libs.tar
 sentry-cli upload-dif lib/x86_64-linux-gnu
 
-echo 'Creating a new deploy in Sentry...'
-sentry-cli releases new "${VERSION}"
-sentry-cli releases set-commits "${VERSION}" --commit "${GITHUB_PROJECT}@${VERSION}"
-sentry-cli releases deploys "${VERSION}" new -e release
-sentry-cli releases finalize "${VERSION}"
+RELEASE=$(< ./release-name)
+echo "Creating a new release and deploy for ${RELEASE} in Sentry..."
+sentry-cli releases new "${RELEASE}"
+# NOTE: Disabled until the repository is properly configured in Sentry
+# sentry-cli releases set-commits "${RELEASE}" --commit "${GITHUB_PROJECT}@${REVISION}"
+sentry-cli releases deploys "${RELEASE}" new -e production
+sentry-cli releases finalize "${RELEASE}"
 echo 'Deploy created.'

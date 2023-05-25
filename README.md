@@ -61,6 +61,8 @@ development:
   also performed in CI.
 - `make clean`: Removes all build artifacts, the virtualenv and cached files.
 
+For more avalibale make targets, please, run `make help`.
+
 Integration tests require Redis and Kafka running in their default
 configuration. The most convenient way to get all required services is via
 [`sentry devservices`](https://develop.sentry.dev/services/devservices/), which
@@ -68,8 +70,9 @@ requires an up-to-date Sentry development environment.
 
 ### Building and Running
 
-The easiest way to rebuild and run Relay is using `cargo`. Depending on the
-configuration, you may need to have a local instance of Sentry running.
+The easiest way to rebuild and run Relay for development is using `cargo`.
+Depending on the configuration, you may need to have a local instance of Sentry
+running.
 
 ```bash
 # Initialize Relay for the first time
@@ -107,7 +110,8 @@ used for Relays operating as proxys. There are two optional features:
   into a Kafka topic instead of forwarding to the configured upstream. Also, it
   will perform full event normalization, filtering, and rate limiting.
 
-- **`ssl`**: Enables SSL support in the Server.
+- **`crash-handler`**: Allows native crash reporting for segfaults and
+  out-of-memory situations when internal error reporting to Sentry is enabled.
 
 To enable a feature, pass it to the cargo invocation. For example, to run tests
 across all workspace crates with the `processing` feature enabled, run:
@@ -142,6 +146,22 @@ make test-integration
 make build
 .venv/bin/pytest tests/integration -k <test_name>
 ```
+
+#### Snapshot tests
+
+We use `insta` for snapshot testing. It will run as part of the `make test` command 
+to validate schema/protocol changes. To install the `insta` tool for reviewing snapshots run:
+```bash
+cargo install cargo-insta
+```
+
+After that you'll be able to review and automatically update snapshot files by running:
+```bash
+cargo insta review
+```
+
+Make sure to run the command if you've made any changed to the event schema/protocol.
+For more information see https://insta.rs/docs/.
 
 ### Linting
 
@@ -187,24 +207,6 @@ make test-python
 # Run a single test manually
 .venv/bin/pytest py/tests -k <test_name>
 ```
-
-### Development Server
-
-If you have `systemfd` and `cargo-watch` installed, the `make devserver` command
-can auto-reload Relay:
-
-```bash
-cargo install systemfd cargo-watch
-make devserver
-```
-
-### SSL
-
-The repository contains a SSL-certificate + private key for development
-purposes. It comes in two formats: Once as a `(.pem, .cert)`-pair, once as
-`.pfx` (PKCS #12) file.
-
-The password for the `.pfx` file is `password`.
 
 ### Usage with Sentry
 

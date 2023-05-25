@@ -1,21 +1,32 @@
 // TODO: Fix casts between RelayGeoIpLookup and GeoIpLookup
 #![allow(clippy::cast_ptr_alignment)]
 #![deny(unused_must_use)]
+#![allow(clippy::derive_partial_eq_without_eq)]
 
 use std::cmp::Ordering;
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::slice;
 
-use relay_common::{glob_match_bytes, GlobOptions};
+use chrono::Utc;
+use once_cell::sync::OnceCell;
+use relay_common::{codeowners_match_bytes, glob_match_bytes, GlobOptions};
+use relay_dynamic_config::{validate_json, ProjectConfig};
 use relay_general::pii::{
-    selector_suggestions_from_value, DataScrubbingConfig, PiiConfig, PiiProcessor,
+    selector_suggestions_from_value, DataScrubbingConfig, PiiConfig, PiiConfigError, PiiProcessor,
 };
 use relay_general::processor::{process_value, split_chunks, ProcessingState};
 use relay_general::protocol::{Event, VALID_PLATFORMS};
-use relay_general::store::{GeoIpLookup, StoreConfig, StoreProcessor};
+use relay_general::store::{
+    light_normalize_event, GeoIpLookup, LightNormalizationConfig, StoreConfig, StoreProcessor,
+};
 use relay_general::types::{Annotated, Remark};
-use relay_sampling::{RuleCondition, SamplingConfig};
+use relay_general::user_agent::RawUserAgentInfo;
+use relay_sampling::{
+    merge_rules_from_configs, DynamicSamplingContext, RuleCondition, SamplingConfig, SamplingMatch,
+    SamplingRule,
+};
+use serde::Serialize;
 
 use crate::core::{RelayBuf, RelayStr};
 
@@ -24,11 +35,6 @@ pub struct RelayGeoIpLookup;
 
 /// The processor that normalizes events for store.
 pub struct RelayStoreNormalizer;
-
-lazy_static::lazy_static! {
-    static ref VALID_PLATFORM_STRS: Vec<RelayStr> =
-        VALID_PLATFORMS.iter().map(|s| RelayStr::new(s)).collect();
-}
 
 /// Chunks the given text based on remarks.
 #[no_mangle]
@@ -58,7 +64,7 @@ pub unsafe extern "C" fn relay_geoip_lookup_new(path: *const c_char) -> *mut Rel
 pub unsafe extern "C" fn relay_geoip_lookup_free(lookup: *mut RelayGeoIpLookup) {
     if !lookup.is_null() {
         let lookup = lookup as *mut GeoIpLookup;
-        Box::from_raw(lookup);
+        let _dropped = Box::from_raw(lookup);
     }
 }
 
@@ -66,11 +72,15 @@ pub unsafe extern "C" fn relay_geoip_lookup_free(lookup: *mut RelayGeoIpLookup) 
 #[no_mangle]
 #[relay_ffi::catch_unwind]
 pub unsafe extern "C" fn relay_valid_platforms(size_out: *mut usize) -> *const RelayStr {
+    static VALID_PLATFORM_STRS: OnceCell<Vec<RelayStr>> = OnceCell::new();
+    let platforms = VALID_PLATFORM_STRS
+        .get_or_init(|| VALID_PLATFORMS.iter().map(|s| RelayStr::new(s)).collect());
+
     if let Some(size_out) = size_out.as_mut() {
-        *size_out = VALID_PLATFORM_STRS.len();
+        *size_out = platforms.len();
     }
 
-    VALID_PLATFORM_STRS.as_ptr()
+    platforms.as_ptr()
 }
 
 /// Creates a new normalization processor.
@@ -92,7 +102,7 @@ pub unsafe extern "C" fn relay_store_normalizer_new(
 pub unsafe extern "C" fn relay_store_normalizer_free(normalizer: *mut RelayStoreNormalizer) {
     if !normalizer.is_null() {
         let normalizer = normalizer as *mut StoreProcessor;
-        Box::from_raw(normalizer);
+        let _dropped = Box::from_raw(normalizer);
     }
 }
 
@@ -105,6 +115,26 @@ pub unsafe extern "C" fn relay_store_normalizer_normalize_event(
 ) -> RelayStr {
     let processor = normalizer as *mut StoreProcessor;
     let mut event = Annotated::<Event>::from_json((*event).as_str())?;
+    let config = (*processor).config();
+    let light_normalization_config = LightNormalizationConfig {
+        client_ip: config.client_ip.as_ref(),
+        user_agent: RawUserAgentInfo {
+            user_agent: config.user_agent.as_deref(),
+            client_hints: config.client_hints.as_deref(),
+        },
+        max_name_and_unit_len: None,
+        received_at: config.received_at,
+        max_secs_in_past: config.max_secs_in_past,
+        max_secs_in_future: config.max_secs_in_future,
+        measurements_config: None, // only supported in relay
+        breakdowns_config: None,   // only supported in relay
+        normalize_user_agent: config.normalize_user_agent,
+        transaction_name_config: Default::default(), // only supported in relay
+        is_renormalize: config.is_renormalize.unwrap_or(false),
+        device_class_synthesis_config: false, // only supported in relay
+        scrub_span_descriptions: false,
+    };
+    light_normalize_event(&mut event, light_normalization_config)?;
     process_value(&mut event, &mut *processor, ProcessingState::root())?;
     RelayStr::from_string(event.to_json()?)
 }
@@ -122,8 +152,11 @@ pub unsafe extern "C" fn relay_translate_legacy_python_json(event: *mut RelayStr
 #[no_mangle]
 #[relay_ffi::catch_unwind]
 pub unsafe extern "C" fn relay_validate_pii_config(value: *const RelayStr) -> RelayStr {
-    match serde_json::from_str((*value).as_str()) {
-        Ok(PiiConfig { .. }) => RelayStr::new(""),
+    match serde_json::from_str::<PiiConfig>((*value).as_str()) {
+        Ok(config) => match config.compiled().force_compile() {
+            Ok(_) => RelayStr::new(""),
+            Err(PiiConfigError::RegexError(source)) => RelayStr::from_string(source.to_string()),
+        },
         Err(e) => RelayStr::from_string(e.to_string()),
     }
 }
@@ -133,9 +166,11 @@ pub unsafe extern "C" fn relay_validate_pii_config(value: *const RelayStr) -> Re
 #[relay_ffi::catch_unwind]
 pub unsafe extern "C" fn relay_convert_datascrubbing_config(config: *const RelayStr) -> RelayStr {
     let config: DataScrubbingConfig = serde_json::from_str((*config).as_str())?;
-    match *config.pii_config() {
-        Some(ref config) => RelayStr::from_string(config.to_json()?),
-        None => RelayStr::new("{}"),
+    match config.pii_config() {
+        Ok(Some(config)) => RelayStr::from_string(config.to_json()?),
+        Ok(None) => RelayStr::new("{}"),
+        // NOTE: Callers of this function must be able to handle this error.
+        Err(e) => RelayStr::from_string(e.to_string()),
     }
 }
 
@@ -147,8 +182,7 @@ pub unsafe extern "C" fn relay_pii_strip_event(
     event: *const RelayStr,
 ) -> RelayStr {
     let config = serde_json::from_str::<PiiConfig>((*config).as_str())?;
-    let compiled = config.compiled();
-    let mut processor = PiiProcessor::new(&compiled);
+    let mut processor = PiiProcessor::new(config.compiled());
 
     let mut event = Annotated::<Event>::from_json((*event).as_str())?;
     process_value(&mut event, &mut processor, ProcessingState::root())?;
@@ -215,6 +249,16 @@ pub unsafe extern "C" fn relay_is_glob_match(
     glob_match_bytes((*value).as_bytes(), (*pat).as_str(), options)
 }
 
+/// Returns `true` if the codeowners path matches the value, `false` otherwise.
+#[no_mangle]
+#[relay_ffi::catch_unwind]
+pub unsafe extern "C" fn relay_is_codeowners_path_match(
+    value: *const RelayBuf,
+    pattern: *const RelayStr,
+) -> bool {
+    codeowners_match_bytes((*value).as_bytes(), (*pattern).as_str())
+}
+
 /// Parse a sentry release structure from a string.
 #[no_mangle]
 #[relay_ffi::catch_unwind]
@@ -270,4 +314,124 @@ pub unsafe extern "C" fn relay_validate_sampling_configuration(value: *const Rel
         }
         Err(e) => RelayStr::from_string(e.to_string()),
     }
+}
+
+/// Validate entire project config.
+///
+/// If `strict` is true, checks for unknown fields in the input.
+#[no_mangle]
+#[relay_ffi::catch_unwind]
+pub unsafe extern "C" fn relay_validate_project_config(
+    value: *const RelayStr,
+    strict: bool,
+) -> RelayStr {
+    let value = (*value).as_str();
+    match validate_json::<ProjectConfig>(value, strict) {
+        Ok(()) => RelayStr::default(),
+        Err(e) => RelayStr::from_string(e.to_string()),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct EphemeralSamplingResult {
+    merged_sampling_configs: Vec<SamplingRule>,
+    sampling_match: Option<SamplingMatch>,
+}
+
+/// Runs dynamic sampling given the sampling config, root sampling config, dsc and event.
+///
+/// Returns the sampling decision containing the sample_rate and the list of matched rule ids.
+#[no_mangle]
+#[relay_ffi::catch_unwind]
+pub unsafe extern "C" fn run_dynamic_sampling(
+    sampling_config: &RelayStr,
+    root_sampling_config: &RelayStr,
+    dsc: &RelayStr,
+    event: &RelayStr,
+) -> RelayStr {
+    let sampling_config = serde_json::from_str::<SamplingConfig>(sampling_config.as_str())?;
+    let root_sampling_config =
+        serde_json::from_str::<SamplingConfig>(root_sampling_config.as_str())?;
+    // We can optionally accept a dsc and event.
+    let dsc = serde_json::from_str::<DynamicSamplingContext>(dsc.as_str());
+    let event = Annotated::<Event>::from_json(event.as_str());
+
+    // Instead of creating a new function, we decided to reuse the existing code here. This will have
+    // the only downside of not having the possibility to set the sample rate to a different value
+    // based on the `SamplingMode` but for this simulation it is not that relevant.
+    let rules: Vec<SamplingRule> =
+        merge_rules_from_configs(Some(&sampling_config), Some(&root_sampling_config))
+            .cloned()
+            .collect();
+
+    // Only if we have both dsc and event we want to run dynamic sampling, otherwise we just return
+    // the merged sampling configs.
+    let match_result = if let (Ok(event), Ok(dsc)) = (event, dsc) {
+        SamplingMatch::match_against_rules(
+            rules.iter(),
+            event.value(),
+            Some(&dsc),
+            None,
+            Utc::now(),
+        )
+    } else {
+        None
+    };
+
+    let result = EphemeralSamplingResult {
+        merged_sampling_configs: rules,
+        sampling_match: match_result,
+    };
+
+    RelayStr::from(serde_json::to_string(&result).unwrap())
+}
+
+#[test]
+fn pii_config_validation_invalid_regex() {
+    let config = r#"
+        {
+          "rules": {
+            "strip-fields": {
+              "type": "redact_pair",
+              "keyPattern": "(not valid regex",
+              "redaction": {
+                "method": "replace",
+                "text": "[Filtered]"
+              }
+            }
+          },
+          "applications": {
+            "*.everything": ["strip-fields"]
+          }
+        }
+    "#;
+    assert_eq!(
+        unsafe { relay_validate_pii_config(&RelayStr::from(config)).as_str() },
+        "regex parse error:\n    (not valid regex\n    ^\nerror: unclosed group"
+    );
+}
+
+#[test]
+fn pii_config_validation_valid_regex() {
+    let config = r#"
+        {
+          "rules": {
+            "strip-fields": {
+              "type": "redact_pair",
+              "keyPattern": "(\\w+)?+",
+              "redaction": {
+                "method": "replace",
+                "text": "[Filtered]"
+              }
+            }
+          },
+          "applications": {
+            "*.everything": ["strip-fields"]
+          }
+        }
+    "#;
+    assert_eq!(
+        unsafe { relay_validate_pii_config(&RelayStr::from(config)).as_str() },
+        ""
+    );
 }

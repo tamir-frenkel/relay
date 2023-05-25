@@ -1,18 +1,39 @@
+//! Authentication and crypto for Relay.
+//!
+//! This library contains the [`PublicKey`] and [`SecretKey`] types, which can be used to validate
+//! and sign traffic between Relays in authenticated endpoints. Additionally, Relays identify via a
+//! [`RelayId`], which is included in the request signature and headers.
+//!
+//! Relay uses Ed25519 at the moment. This is considered an implementation detail and is subject to
+//! change at any time. Do not rely on a specific signing mechanism.
+//!
+//! # Generating Credentials
+//!
+//! Use the [`generate_relay_id`] and [`generate_key_pair`] function to generate credentials:
+//!
+//! ```
+//! let relay_id = relay_auth::generate_relay_id();
+//! let (private_key, public_key) = relay_auth::generate_key_pair();
+//! ```
+
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/getsentry/relay/master/artwork/relay-icon.png",
     html_favicon_url = "https://raw.githubusercontent.com/getsentry/relay/master/artwork/relay-icon.png"
 )]
+
 use std::fmt;
 use std::str::FromStr;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
-use failure::Fail;
+use chrono::{DateTime, Duration, Utc};
+use data_encoding::BASE64URL_NOPAD;
+use ed25519_dalek::{Signer, Verifier};
 use hmac::{Hmac, Mac};
-use rand::{rngs::OsRng, thread_rng, RngCore};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::Sha512;
-
+use rand::rngs::OsRng;
+use rand::{thread_rng, RngCore};
 use relay_common::{UnixTimestamp, Uuid};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use sha2::Sha512;
 
 include!(concat!(env!("OUT_DIR"), "/constants.gen.rs"));
 
@@ -73,8 +94,8 @@ impl fmt::Display for RelayVersion {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Fail)]
-#[fail(display = "hello")]
+#[derive(Clone, Copy, Debug, Default, thiserror::Error)]
+#[error("invalid relay version string")]
 pub struct ParseRelayVersionError;
 
 impl FromStr for RelayVersion {
@@ -96,30 +117,30 @@ impl FromStr for RelayVersion {
 relay_common::impl_str_serde!(RelayVersion, "a version string");
 
 /// Raised if a key could not be parsed.
-#[derive(Debug, Fail, PartialEq, Eq, Hash)]
+#[derive(Debug, Eq, Hash, PartialEq, thiserror::Error)]
 pub enum KeyParseError {
     /// Invalid key encoding.
-    #[fail(display = "bad key encoding")]
+    #[error("bad key encoding")]
     BadEncoding,
     /// Invalid key data.
-    #[fail(display = "bad key data")]
+    #[error("bad key data")]
     BadKey,
 }
 
 /// Raised to indicate failure on unpacking.
-#[derive(Debug, Fail)]
+#[derive(Debug, thiserror::Error)]
 pub enum UnpackError {
     /// Raised if the signature is invalid.
-    #[fail(display = "invalid signature on data")]
+    #[error("invalid signature on data")]
     BadSignature,
     /// Invalid key encoding.
-    #[fail(display = "bad key encoding")]
+    #[error("bad key encoding")]
     BadEncoding,
     /// Raised if deserializing of data failed.
-    #[fail(display = "could not deserialize payload")]
-    BadPayload(#[cause] serde_json::Error),
+    #[error("could not deserialize payload")]
+    BadPayload(#[source] serde_json::Error),
     /// Raised on unpacking if the data is too old.
-    #[fail(display = "signature is too old")]
+    #[error("signature is too old")]
     SignatureExpired,
 }
 
@@ -152,31 +173,14 @@ impl Default for SignatureHeader {
     }
 }
 
-/// Represents the public key of an relay.
-///
-/// Public keys are based on ed25519 but this should be considered an
-/// implementation detail for now.  We only ever represent public keys
-/// on the wire as opaque ascii encoded strings of arbitrary format or length.
-#[derive(Clone)]
-pub struct PublicKey {
-    inner: ed25519_dalek::PublicKey,
-}
-
 /// Represents the secret key of an relay.
 ///
 /// Secret keys are based on ed25519 but this should be considered an
 /// implementation detail for now.  We only ever represent public keys
 /// on the wire as opaque ascii encoded strings of arbitrary format or length.
+#[derive(Clone)]
 pub struct SecretKey {
-    inner: ed25519_dalek::Keypair,
-}
-
-impl Clone for SecretKey {
-    fn clone(&self) -> SecretKey {
-        SecretKey {
-            inner: ed25519_dalek::Keypair::from_bytes(&self.inner.to_bytes()[..]).unwrap(),
-        }
-    }
+    inner: ed25519_dalek::SigningKey,
 }
 
 /// Represents the final registration.
@@ -201,11 +205,11 @@ impl SecretKey {
     pub fn sign_with_header(&self, data: &[u8], header: &SignatureHeader) -> String {
         let mut header =
             serde_json::to_vec(&header).expect("attempted to pack non json safe header");
-        let header_encoded = base64::encode_config(&header[..], base64::URL_SAFE_NO_PAD);
+        let header_encoded = BASE64URL_NOPAD.encode(&header);
         header.push(b'\x00');
         header.extend_from_slice(data);
-        let sig = self.inner.sign::<Sha512>(&header);
-        let mut sig_encoded = base64::encode_config(&sig.to_bytes()[..], base64::URL_SAFE_NO_PAD);
+        let sig = self.inner.sign(&header);
+        let mut sig_encoded = BASE64URL_NOPAD.encode(&sig.to_bytes());
         sig_encoded.push('.');
         sig_encoded.push_str(&header_encoded);
         sig_encoded
@@ -232,7 +236,7 @@ impl SecretKey {
 
 impl PartialEq for SecretKey {
     fn eq(&self, other: &SecretKey) -> bool {
-        self.inner.to_bytes()[..] == other.inner.to_bytes()[..]
+        self.inner.to_keypair_bytes() == other.inner.to_keypair_bytes()
     }
 }
 
@@ -242,21 +246,21 @@ impl FromStr for SecretKey {
     type Err = KeyParseError;
 
     fn from_str(s: &str) -> Result<SecretKey, KeyParseError> {
-        let bytes = match base64::decode_config(s, base64::URL_SAFE_NO_PAD) {
+        let bytes = match BASE64URL_NOPAD.decode(s.as_bytes()) {
             Ok(bytes) => bytes,
             _ => return Err(KeyParseError::BadEncoding),
         };
 
-        Ok(SecretKey {
-            inner: if bytes.len() == 64 {
-                ed25519_dalek::Keypair::from_bytes(&bytes).map_err(|_| KeyParseError::BadKey)?
-            } else {
-                let secret = ed25519_dalek::SecretKey::from_bytes(&bytes)
-                    .map_err(|_| KeyParseError::BadKey)?;
-                let public = ed25519_dalek::PublicKey::from_secret::<Sha512>(&secret);
-                ed25519_dalek::Keypair { secret, public }
-            },
-        })
+        let inner = if let Ok(keypair) = bytes.as_slice().try_into() {
+            ed25519_dalek::SigningKey::from_keypair_bytes(&keypair)
+                .map_err(|_| KeyParseError::BadKey)?
+        } else if let Ok(secret_key) = bytes.try_into() {
+            ed25519_dalek::SigningKey::from_bytes(&secret_key)
+        } else {
+            return Err(KeyParseError::BadKey);
+        };
+
+        Ok(SecretKey { inner })
     }
 }
 
@@ -266,25 +270,31 @@ impl fmt::Display for SecretKey {
             write!(
                 f,
                 "{}",
-                base64::encode_config(&self.inner.to_bytes()[..], base64::URL_SAFE_NO_PAD)
+                BASE64URL_NOPAD.encode(&self.inner.to_keypair_bytes())
             )
         } else {
-            write!(
-                f,
-                "{}",
-                base64::encode_config(&self.inner.secret.to_bytes()[..], base64::URL_SAFE_NO_PAD)
-            )
+            write!(f, "{}", BASE64URL_NOPAD.encode(&self.inner.to_bytes()))
         }
     }
 }
 
 impl fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SecretKey(\"{}\")", self)
+        write!(f, "SecretKey(\"{self}\")")
     }
 }
 
 relay_common::impl_str_serde!(SecretKey, "a secret key");
+
+/// Represents the public key of a relay.
+///
+/// Public keys are based on ed25519 but this should be considered an
+/// implementation detail for now.  We only ever represent public keys
+/// on the wire as opaque ascii encoded strings of arbitrary format or length.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PublicKey {
+    inner: ed25519_dalek::VerifyingKey,
+}
 
 impl PublicKey {
     /// Verifies the signature and returns the embedded signature
@@ -292,23 +302,19 @@ impl PublicKey {
     pub fn verify_meta(&self, data: &[u8], sig: &str) -> Option<SignatureHeader> {
         let mut iter = sig.splitn(2, '.');
         let sig_bytes = match iter.next() {
-            Some(sig_encoded) => {
-                base64::decode_config(sig_encoded, base64::URL_SAFE_NO_PAD).ok()?
-            }
+            Some(sig_encoded) => BASE64URL_NOPAD.decode(sig_encoded.as_bytes()).ok()?,
             None => return None,
         };
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes).ok()?;
+        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).ok()?;
 
         let header = match iter.next() {
-            Some(header_encoded) => {
-                base64::decode_config(header_encoded, base64::URL_SAFE_NO_PAD).ok()?
-            }
+            Some(header_encoded) => BASE64URL_NOPAD.decode(header_encoded.as_bytes()).ok()?,
             None => return None,
         };
         let mut to_verify = header.clone();
         to_verify.push(b'\x00');
         to_verify.extend_from_slice(data);
-        if self.inner.verify::<Sha512>(&to_verify, &sig).is_ok() {
+        if self.inner.verify(&to_verify, &sig).is_ok() {
             serde_json::from_slice(&header).ok()
         } else {
             None
@@ -361,42 +367,33 @@ impl PublicKey {
     }
 }
 
-impl PartialEq for PublicKey {
-    fn eq(&self, other: &PublicKey) -> bool {
-        self.inner.to_bytes()[..] == other.inner.to_bytes()[..]
-    }
-}
-
-impl Eq for PublicKey {}
-
 impl FromStr for PublicKey {
     type Err = KeyParseError;
 
     fn from_str(s: &str) -> Result<PublicKey, KeyParseError> {
-        let bytes = match base64::decode_config(s, base64::URL_SAFE_NO_PAD) {
-            Ok(bytes) => bytes,
-            _ => return Err(KeyParseError::BadEncoding),
+        let Ok(bytes) = BASE64URL_NOPAD.decode(s.as_bytes()) else {
+            return Err(KeyParseError::BadEncoding)
         };
-        Ok(PublicKey {
-            inner: ed25519_dalek::PublicKey::from_bytes(&bytes)
+
+        let inner = match bytes.try_into() {
+            Ok(bytes) => ed25519_dalek::VerifyingKey::from_bytes(&bytes)
                 .map_err(|_| KeyParseError::BadKey)?,
-        })
+            Err(_) => return Err(KeyParseError::BadKey),
+        };
+
+        Ok(PublicKey { inner })
     }
 }
 
 impl fmt::Display for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            base64::encode_config(&self.inner.to_bytes()[..], base64::URL_SAFE_NO_PAD)
-        )
+        write!(f, "{}", BASE64URL_NOPAD.encode(&self.inner.to_bytes()))
     }
 }
 
 impl fmt::Debug for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PublicKey(\"{}\")", self)
+        write!(f, "PublicKey(\"{self}\")")
     }
 }
 
@@ -409,9 +406,9 @@ pub fn generate_relay_id() -> RelayId {
 
 /// Generates a secret + public key pair.
 pub fn generate_key_pair() -> (SecretKey, PublicKey) {
-    let mut csprng = OsRng::new().unwrap();
-    let kp = ed25519_dalek::Keypair::generate::<Sha512, _>(&mut csprng);
-    let pk = ed25519_dalek::PublicKey::from_bytes(&kp.public.as_bytes()[..]).unwrap();
+    let mut csprng = OsRng;
+    let kp = ed25519_dalek::SigningKey::generate(&mut csprng);
+    let pk = kp.verifying_key();
     (SecretKey { inner: kp }, PublicKey { inner: pk })
 }
 
@@ -439,19 +436,19 @@ pub struct SignedRegisterState(String);
 impl SignedRegisterState {
     /// Creates an Hmac instance for signing the `RegisterState`.
     fn mac(secret: &[u8]) -> Hmac<Sha512> {
-        Hmac::new_varkey(secret).expect("HMAC takes variable keys")
+        Hmac::new_from_slice(secret).expect("HMAC takes variable keys")
     }
 
     /// Signs the given `RegisterState` and serializes it into a single string.
     fn sign(state: RegisterState, secret: &[u8]) -> Self {
         let json = serde_json::to_string(&state).expect("relay register state serializes to JSON");
-        let token = base64::encode_config(&json, base64::URL_SAFE_NO_PAD);
+        let token = BASE64URL_NOPAD.encode(json.as_bytes());
 
         let mut mac = Self::mac(secret);
-        mac.input(token.as_bytes());
-        let signature = base64::encode_config(&mac.result().code(), base64::URL_SAFE_NO_PAD);
+        mac.update(token.as_bytes());
+        let signature = BASE64URL_NOPAD.encode(&mac.finalize().into_bytes());
 
-        Self(format!("{}:{}", token, signature))
+        Self(format!("{token}:{signature}"))
     }
 
     /// Splits the signed state into the encoded state and encoded signature.
@@ -475,21 +472,24 @@ impl SignedRegisterState {
         max_age: Option<Duration>,
     ) -> Result<RegisterState, UnpackError> {
         let (token, signature) = self.split();
-        let code = base64::decode_config(signature, base64::URL_SAFE_NO_PAD)
+        let code = BASE64URL_NOPAD
+            .decode(signature.as_bytes())
             .map_err(|_| UnpackError::BadEncoding)?;
 
         let mut mac = Self::mac(secret);
-        mac.input(token.as_bytes());
-        mac.verify(&code).map_err(|_| UnpackError::BadSignature)?;
+        mac.update(token.as_bytes());
+        mac.verify_slice(&code)
+            .map_err(|_| UnpackError::BadSignature)?;
 
-        let json = base64::decode_config(token, base64::URL_SAFE_NO_PAD)
+        let json = BASE64URL_NOPAD
+            .decode(token.as_bytes())
             .map_err(|_| UnpackError::BadEncoding)?;
         let state =
             serde_json::from_slice::<RegisterState>(&json).map_err(UnpackError::BadPayload)?;
 
         if let Some(max_age) = max_age {
             let secs = state.timestamp().as_secs() as i64;
-            if Utc.timestamp(secs, 0) + max_age < Utc::now() {
+            if secs + max_age.num_seconds() < Utc::now().timestamp() {
                 return Err(UnpackError::SignatureExpired);
             }
         }
@@ -539,7 +539,7 @@ fn nonce() -> String {
     let mut rng = thread_rng();
     let mut bytes = vec![0u8; 64];
     rng.fill_bytes(&mut bytes);
-    base64::encode_config(&bytes, base64::URL_SAFE_NO_PAD)
+    BASE64URL_NOPAD.encode(&bytes)
 }
 
 /// Represents a request for registration with the upstream.
@@ -683,217 +683,223 @@ impl RegisterResponse {
     }
 }
 
-#[test]
-fn test_keys() {
-    let sk: SecretKey =
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_keys() {
+        let sk: SecretKey =
         "OvXFVm1tIUi8xDTuyHX1SSqdMc8nCt2qU9IUaH5p7oUk5pHZsdnfXNiMWiMLtSE86J3N9Peo5CBP1YQHDUkApQ"
             .parse()
             .unwrap();
-    let pk: PublicKey = "JOaR2bHZ31zYjFojC7UhPOidzfT3qOQgT9WEBw1JAKU"
-        .parse()
-        .unwrap();
+        let pk: PublicKey = "JOaR2bHZ31zYjFojC7UhPOidzfT3qOQgT9WEBw1JAKU"
+            .parse()
+            .unwrap();
 
-    assert_eq!(
-        sk.to_string(),
-        "OvXFVm1tIUi8xDTuyHX1SSqdMc8nCt2qU9IUaH5p7oU"
-    );
-    assert_eq!(
-        format!("{:#}", sk),
+        assert_eq!(
+            sk.to_string(),
+            "OvXFVm1tIUi8xDTuyHX1SSqdMc8nCt2qU9IUaH5p7oU"
+        );
+        assert_eq!(
+        format!("{sk:#}"),
         "OvXFVm1tIUi8xDTuyHX1SSqdMc8nCt2qU9IUaH5p7oUk5pHZsdnfXNiMWiMLtSE86J3N9Peo5CBP1YQHDUkApQ"
     );
-    assert_eq!(
-        pk.to_string(),
-        "JOaR2bHZ31zYjFojC7UhPOidzfT3qOQgT9WEBw1JAKU"
-    );
+        assert_eq!(
+            pk.to_string(),
+            "JOaR2bHZ31zYjFojC7UhPOidzfT3qOQgT9WEBw1JAKU"
+        );
 
-    assert_eq!(
-        "bad data".parse::<SecretKey>(),
-        Err(KeyParseError::BadEncoding)
-    );
-    assert_eq!("OvXF".parse::<SecretKey>(), Err(KeyParseError::BadKey));
+        assert_eq!(
+            "bad data".parse::<SecretKey>(),
+            Err(KeyParseError::BadEncoding)
+        );
+        assert_eq!("OvXF".parse::<SecretKey>(), Err(KeyParseError::BadKey));
 
-    assert_eq!(
-        "bad data".parse::<PublicKey>(),
-        Err(KeyParseError::BadEncoding)
-    );
-    assert_eq!("OvXF".parse::<PublicKey>(), Err(KeyParseError::BadKey));
-}
+        assert_eq!(
+            "bad data".parse::<PublicKey>(),
+            Err(KeyParseError::BadEncoding)
+        );
+        assert_eq!("OvXF".parse::<PublicKey>(), Err(KeyParseError::BadKey));
+    }
 
-#[test]
-fn test_serializing() {
-    let sk: SecretKey =
+    #[test]
+    fn test_serializing() {
+        let sk: SecretKey =
         "OvXFVm1tIUi8xDTuyHX1SSqdMc8nCt2qU9IUaH5p7oUk5pHZsdnfXNiMWiMLtSE86J3N9Peo5CBP1YQHDUkApQ"
             .parse()
             .unwrap();
-    let pk: PublicKey = "JOaR2bHZ31zYjFojC7UhPOidzfT3qOQgT9WEBw1JAKU"
-        .parse()
-        .unwrap();
+        let pk: PublicKey = "JOaR2bHZ31zYjFojC7UhPOidzfT3qOQgT9WEBw1JAKU"
+            .parse()
+            .unwrap();
 
-    let sk_json = serde_json::to_string(&sk).unwrap();
-    assert_eq!(sk_json, "\"OvXFVm1tIUi8xDTuyHX1SSqdMc8nCt2qU9IUaH5p7oU\"");
+        let sk_json = serde_json::to_string(&sk).unwrap();
+        assert_eq!(sk_json, "\"OvXFVm1tIUi8xDTuyHX1SSqdMc8nCt2qU9IUaH5p7oU\"");
 
-    let pk_json = serde_json::to_string(&pk).unwrap();
-    assert_eq!(pk_json, "\"JOaR2bHZ31zYjFojC7UhPOidzfT3qOQgT9WEBw1JAKU\"");
+        let pk_json = serde_json::to_string(&pk).unwrap();
+        assert_eq!(pk_json, "\"JOaR2bHZ31zYjFojC7UhPOidzfT3qOQgT9WEBw1JAKU\"");
 
-    assert_eq!(serde_json::from_str::<SecretKey>(&sk_json).unwrap(), sk);
-    assert_eq!(serde_json::from_str::<PublicKey>(&pk_json).unwrap(), pk);
-}
+        assert_eq!(serde_json::from_str::<SecretKey>(&sk_json).unwrap(), sk);
+        assert_eq!(serde_json::from_str::<PublicKey>(&pk_json).unwrap(), pk);
+    }
 
-#[test]
-fn test_signatures() {
-    let (sk, pk) = generate_key_pair();
-    let data = b"Hello World!";
+    #[test]
+    fn test_signatures() {
+        let (sk, pk) = generate_key_pair();
+        let data = b"Hello World!";
 
-    let sig = sk.sign(data);
-    assert!(pk.verify(data, &sig));
+        let sig = sk.sign(data);
+        assert!(pk.verify(data, &sig));
 
-    let bad_sig =
+        let bad_sig =
         "jgubwSf2wb2wuiRpgt2H9_bdDSMr88hXLp5zVuhbr65EGkSxOfT5ILIWr623twLgLd0bDgHg6xzOaUCX7XvUCw";
-    assert!(!pk.verify(data, bad_sig));
-}
+        assert!(!pk.verify(data, bad_sig));
+    }
 
-#[test]
-fn test_registration() {
-    let max_age = Duration::minutes(15);
+    #[test]
+    fn test_registration() {
+        let max_age = Duration::minutes(15);
 
-    // initial setup
-    let relay_id = generate_relay_id();
-    let (sk, pk) = generate_key_pair();
+        // initial setup
+        let relay_id = generate_relay_id();
+        let (sk, pk) = generate_key_pair();
 
-    // create a register request
-    let request = RegisterRequest::new(&relay_id, &pk);
+        // create a register request
+        let request = RegisterRequest::new(&relay_id, &pk);
 
-    // sign it
-    let (request_bytes, request_sig) = sk.pack(&request);
+        // sign it
+        let (request_bytes, request_sig) = sk.pack(request);
 
-    // attempt to get the data through bootstrap unpacking.
-    let request =
-        RegisterRequest::bootstrap_unpack(&request_bytes, &request_sig, Some(max_age)).unwrap();
-    assert_eq!(request.relay_id(), relay_id);
-    assert_eq!(request.public_key(), &pk);
+        // attempt to get the data through bootstrap unpacking.
+        let request =
+            RegisterRequest::bootstrap_unpack(&request_bytes, &request_sig, Some(max_age)).unwrap();
+        assert_eq!(request.relay_id(), relay_id);
+        assert_eq!(request.public_key(), &pk);
 
-    let upstream_secret = b"secret";
+        let upstream_secret = b"secret";
 
-    // create a challenge
-    let challenge = request.into_challenge(upstream_secret);
-    let challenge_token = challenge.token().to_owned();
-    assert_eq!(challenge.relay_id(), &relay_id);
-    assert!(challenge.token().len() > 40);
+        // create a challenge
+        let challenge = request.into_challenge(upstream_secret);
+        let challenge_token = challenge.token().to_owned();
+        assert_eq!(challenge.relay_id(), &relay_id);
+        assert!(challenge.token().len() > 40);
 
-    // check the challenge contains the expected info
-    let state = SignedRegisterState(challenge_token.clone());
-    let register_state = state.unpack(upstream_secret, None).unwrap();
-    assert_eq!(register_state.public_key, pk);
-    assert_eq!(register_state.relay_id, relay_id);
+        // check the challenge contains the expected info
+        let state = SignedRegisterState(challenge_token.clone());
+        let register_state = state.unpack(upstream_secret, None).unwrap();
+        assert_eq!(register_state.public_key, pk);
+        assert_eq!(register_state.relay_id, relay_id);
 
-    // create a response from the challenge
-    let response = challenge.into_response();
+        // create a response from the challenge
+        let response = challenge.into_response();
 
-    // sign and unsign it
-    let (response_bytes, response_sig) = sk.pack(&response);
-    let (response, _) = RegisterResponse::unpack(
-        &response_bytes,
-        &response_sig,
-        upstream_secret,
-        Some(max_age),
-    )
-    .unwrap();
+        // sign and unsign it
+        let (response_bytes, response_sig) = sk.pack(response);
+        let (response, _) = RegisterResponse::unpack(
+            &response_bytes,
+            &response_sig,
+            upstream_secret,
+            Some(max_age),
+        )
+        .unwrap();
 
-    assert_eq!(response.relay_id(), relay_id);
-    assert_eq!(response.token(), challenge_token);
-    assert_eq!(response.version, LATEST_VERSION);
-}
-/// This is a pseudo-test to easily generate the strings used by test_auth.py
-/// You can copy the output to the top of the test_auth.py when there are changes in the
-/// exchanged authentication structures.
-/// It follows test_registration but instead of asserting it prints the strings
-#[test]
-fn test_generate_strings_for_test_auth_py() {
-    let max_age = Duration::minutes(15);
-    println!("Generating test data for test_auth.py...");
+        assert_eq!(response.relay_id(), relay_id);
+        assert_eq!(response.token(), challenge_token);
+        assert_eq!(response.version, LATEST_VERSION);
+    }
 
-    // initial setup
-    let relay_id = generate_relay_id();
-    println!("RELAY_ID = b\"{}\"", relay_id);
-    let (sk, pk) = generate_key_pair();
-    println!("RELAY_KEY = b\"{}\"", pk);
+    /// This is a pseudo-test to easily generate the strings used by test_auth.py
+    /// You can copy the output to the top of the test_auth.py when there are changes in the
+    /// exchanged authentication structures.
+    /// It follows test_registration but instead of asserting it prints the strings
+    #[test]
+    fn test_generate_strings_for_test_auth_py() {
+        let max_age = Duration::minutes(15);
+        println!("Generating test data for test_auth.py...");
 
-    // create a register request
-    let request = RegisterRequest::new(&relay_id, &pk);
-    println!("REQUEST = b'{}'", serde_json::to_string(&request).unwrap());
+        // initial setup
+        let relay_id = generate_relay_id();
+        println!("RELAY_ID = b\"{relay_id}\"");
+        let (sk, pk) = generate_key_pair();
+        println!("RELAY_KEY = b\"{pk}\"");
 
-    // sign it
-    let (request_bytes, request_sig) = sk.pack(&request);
-    println!("REQUEST_SIG = \"{}\"", request_sig);
+        // create a register request
+        let request = RegisterRequest::new(&relay_id, &pk);
+        println!("REQUEST = b'{}'", serde_json::to_string(&request).unwrap());
 
-    // attempt to get the data through bootstrap unpacking.
-    let request =
-        RegisterRequest::bootstrap_unpack(&request_bytes, &request_sig, Some(max_age)).unwrap();
+        // sign it
+        let (request_bytes, request_sig) = sk.pack(&request);
+        println!("REQUEST_SIG = \"{request_sig}\"");
 
-    let upstream_secret = b"secret";
+        // attempt to get the data through bootstrap unpacking.
+        let request =
+            RegisterRequest::bootstrap_unpack(&request_bytes, &request_sig, Some(max_age)).unwrap();
 
-    // create a challenge
-    let challenge = request.into_challenge(upstream_secret);
-    let challenge_token = challenge.token().to_owned();
-    println!("TOKEN = \"{}\"", challenge_token);
+        let upstream_secret = b"secret";
 
-    // create a response from the challenge
-    let response = challenge.into_response();
-    let serialized_response = serde_json::to_string(&response).unwrap();
-    let (_, response_sig) = sk.pack(&response);
+        // create a challenge
+        let challenge = request.into_challenge(upstream_secret);
+        let challenge_token = challenge.token().to_owned();
+        println!("TOKEN = \"{challenge_token}\"");
 
-    println!("RESPONSE = b'{}'", serialized_response);
-    println!("RESPONSE_SIG = \"{}\"", response_sig);
+        // create a response from the challenge
+        let response = challenge.into_response();
+        let serialized_response = serde_json::to_string(&response).unwrap();
+        let (_, response_sig) = sk.pack(&response);
 
-    println!("RELAY_VERSION = \"{}\"", &LATEST_VERSION);
-}
+        println!("RESPONSE = b'{serialized_response}'");
+        println!("RESPONSE_SIG = \"{response_sig}\"");
 
-/// Test we can still deserialize an old response that does not contain the version
-#[test]
-fn test_deserialize_old_response() {
-    let serialized_challenge = "{\"relay_id\":\"6b7d15b8-cee2-4354-9fee-dae7ef43e434\",\"token\":\"eyJ0aW1lc3RhbXAiOjE1OTg5Njc0MzQsInJlbGF5X2lkIjoiNmI3ZDE1YjgtY2VlMi00MzU0LTlmZWUtZGFlN2VmNDNlNDM0IiwicHVibGljX2tleSI6ImtNcEdieWRIWlN2b2h6ZU1sZ2hjV3dIZDhNa3JlS0d6bF9uY2RrWlNPTWciLCJyYW5kIjoiLUViNG9Hal80dUZYOUNRRzFBVmdqTjRmdGxaNU9DSFlNOFl2d1podmlyVXhUY0tFSWYtQzhHaldsZmgwQTNlMzYxWE01dVh0RHhvN00tbWhZeXpWUWcifQ:KJUDXlwvibKNQmex-_Cu1U0FArlmoDkyqP7bYIDGrLXudfjGfCjH-UjNsUHWVDnbM28YdQ-R2MBSyF51aRLQcw\"}";
-    let result: RegisterResponse = serde_json::from_str(serialized_challenge).unwrap();
-    assert_eq!(
-        result.relay_id,
-        Uuid::parse_str("6b7d15b8-cee2-4354-9fee-dae7ef43e434").unwrap()
-    )
-}
+        println!("RELAY_VERSION = \"{}\"", &LATEST_VERSION);
+    }
 
-#[test]
-fn test_relay_version_current() {
-    assert_eq!(
-        env!("CARGO_PKG_VERSION"),
-        RelayVersion::current().to_string()
-    );
-}
+    /// Test we can still deserialize an old response that does not contain the version
+    #[test]
+    fn test_deserialize_old_response() {
+        let serialized_challenge = "{\"relay_id\":\"6b7d15b8-cee2-4354-9fee-dae7ef43e434\",\"token\":\"eyJ0aW1lc3RhbXAiOjE1OTg5Njc0MzQsInJlbGF5X2lkIjoiNmI3ZDE1YjgtY2VlMi00MzU0LTlmZWUtZGFlN2VmNDNlNDM0IiwicHVibGljX2tleSI6ImtNcEdieWRIWlN2b2h6ZU1sZ2hjV3dIZDhNa3JlS0d6bF9uY2RrWlNPTWciLCJyYW5kIjoiLUViNG9Hal80dUZYOUNRRzFBVmdqTjRmdGxaNU9DSFlNOFl2d1podmlyVXhUY0tFSWYtQzhHaldsZmgwQTNlMzYxWE01dVh0RHhvN00tbWhZeXpWUWcifQ:KJUDXlwvibKNQmex-_Cu1U0FArlmoDkyqP7bYIDGrLXudfjGfCjH-UjNsUHWVDnbM28YdQ-R2MBSyF51aRLQcw\"}";
+        let result: RegisterResponse = serde_json::from_str(serialized_challenge).unwrap();
+        assert_eq!(
+            result.relay_id,
+            Uuid::parse_str("6b7d15b8-cee2-4354-9fee-dae7ef43e434").unwrap()
+        )
+    }
 
-#[test]
-fn test_relay_version_oldest() {
-    // Regression test against unintentional changes.
-    assert_eq!("0.0.0", RelayVersion::oldest().to_string());
-}
+    #[test]
+    fn test_relay_version_current() {
+        assert_eq!(
+            env!("CARGO_PKG_VERSION"),
+            RelayVersion::current().to_string()
+        );
+    }
 
-#[test]
-fn test_relay_version_parse() {
-    assert_eq!(
-        RelayVersion::new(20, 7, 0),
-        "20.7.0-beta.0".parse().unwrap()
-    );
-}
+    #[test]
+    fn test_relay_version_oldest() {
+        // Regression test against unintentional changes.
+        assert_eq!("0.0.0", RelayVersion::oldest().to_string());
+    }
 
-#[test]
-fn test_relay_version_oldest_supported() {
-    assert!(RelayVersion::oldest().supported());
-}
+    #[test]
+    fn test_relay_version_parse() {
+        assert_eq!(
+            RelayVersion::new(20, 7, 0),
+            "20.7.0-beta.0".parse().unwrap()
+        );
+    }
 
-#[test]
-fn test_relay_version_any_supported() {
-    // Every version must be supported at the moment.
-    // This test can be changed when dropping support for older versions.
-    assert!(RelayVersion::default().supported());
-}
+    #[test]
+    fn test_relay_version_oldest_supported() {
+        assert!(RelayVersion::oldest().supported());
+    }
 
-#[test]
-fn test_relay_version_from_str() {
-    assert_eq!(RelayVersion::new(20, 7, 0), "20.7.0".parse().unwrap());
+    #[test]
+    fn test_relay_version_any_supported() {
+        // Every version must be supported at the moment.
+        // This test can be changed when dropping support for older versions.
+        assert!(RelayVersion::default().supported());
+    }
+
+    #[test]
+    fn test_relay_version_from_str() {
+        assert_eq!(RelayVersion::new(20, 7, 0), "20.7.0".parse().unwrap());
+    }
 }

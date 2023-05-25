@@ -17,6 +17,41 @@ def test_envelope(mini_sentry, relay_chain):
     assert event["logentry"] == {"formatted": "Hello, World!"}
 
 
+def test_envelope_close_connection(mini_sentry, relay):
+    """Prematurely closing the TCP connection on the client side does not drop the envelope"""
+    import socket
+    import time
+
+    mini_sentry.add_basic_project_config(42)
+    dsn_key = mini_sentry.get_dsn_public_key(42, 0)
+    relay = relay(mini_sentry)
+
+    # Prepare POST data:
+    body_template = """{"event_id": "9ec79c33ec9942ab8353589fcb2e04dc","dsn": "https://%s:@sentry.io/42"}
+{"type":"attachment","length":11,"content_type":"text/plain","filename":"hello.txt"}
+Hello World
+"""
+
+    # Run multiple times to cover potential test flakiness.
+    num_iterations = 10
+    for _ in range(num_iterations):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect(relay.server_address)
+
+        body = body_template % dsn_key
+        req = f"""POST /api/42/envelope/ HTTP/1.1\r\nContent-Length: {len(body)}\r\n\r\n{body}""".encode()
+        sock.send(req)
+
+        time.sleep(0.0001)  # Give relay time to start processing event
+
+        sock.close()  # Close the connection
+
+    for _ in range(num_iterations):
+        envelope = mini_sentry.captured_events.get(timeout=1)
+        assert envelope
+    assert mini_sentry.captured_events.empty()
+
+
 def test_envelope_empty(mini_sentry, relay):
     relay = relay(mini_sentry)
     PROJECT_ID = 42
@@ -56,11 +91,23 @@ def test_unknown_item(mini_sentry, relay):
     envelope.add_item(
         Item(payload=PayloadRef(bytes=b"something"), type="invalid_unknown")
     )
+    attachment = Item(payload=PayloadRef(bytes=b"something"), type="attachment")
+    attachment.headers["attachment_type"] = "attachment_unknown"
+    envelope.add_item(attachment)
     relay.send_envelope(PROJECT_ID, envelope)
 
-    envelope = mini_sentry.captured_events.get(timeout=1)
-    assert len(envelope.items) == 1
-    assert envelope.items[0].type == "invalid_unknown"
+    envelopes = [  # non-event items are split into separate envelopes, so fetch 2x here
+        mini_sentry.captured_events.get(timeout=1),
+        mini_sentry.captured_events.get(timeout=1),
+    ]
+
+    types = {
+        (item.type, item.headers.get("attachment_type"))
+        for envelope in envelopes
+        for item in envelope.items
+    }
+
+    assert types == {("invalid_unknown", None), ("attachment", "attachment_unknown")}
 
 
 def test_drop_unknown_item(mini_sentry, relay):
@@ -69,12 +116,19 @@ def test_drop_unknown_item(mini_sentry, relay):
     mini_sentry.add_basic_project_config(PROJECT_ID)
 
     envelope = Envelope()
+    envelope.add_item(Item(payload=PayloadRef(bytes=b"something"), type="attachment"))
     envelope.add_item(
         Item(payload=PayloadRef(bytes=b"something"), type="invalid_unknown")
     )
+    attachment = Item(payload=PayloadRef(bytes=b"something"), type="attachment")
+    attachment.headers["attachment_type"] = "attachment_unknown"
+    envelope.add_item(attachment)
     relay.send_envelope(PROJECT_ID, envelope)
 
-    # there is nothing sent to the upstream
+    envelope = mini_sentry.captured_events.get(timeout=1)
+    assert len(envelope.items) == 1
+    assert envelope.items[0].type == "attachment"
+
     with pytest.raises(queue.Empty):
         mini_sentry.captured_events.get(timeout=1)
 
@@ -84,6 +138,7 @@ def generate_transaction_item():
         "event_id": "d2132d31b39445f1938d7e21b6bf0ec4",
         "type": "transaction",
         "transaction": "/organizations/:orgId/performance/:eventSlug/",
+        "transaction_info": {"source": "route"},
         "start_timestamp": 1597976392.6542819,
         "timestamp": 1597976400.6189718,
         "contexts": {
@@ -122,6 +177,7 @@ def test_normalize_measurement_interface(
                 "LCP": {"value": 420.69},
                 "   lcp_final.element-Size123  ": {"value": 1},
                 "fid": {"value": 2020},
+                "inp": {"value": 100.14},
                 "cls": {"value": None},
                 "fp": {"value": "im a first paint"},
                 "Total Blocking Time": {"value": 3.14159},
@@ -139,11 +195,11 @@ def test_normalize_measurement_interface(
     assert "trace" in event["contexts"]
     assert "measurements" in event, event
     assert event["measurements"] == {
-        "lcp": {"value": 420.69},
-        "lcp_final.element-size123": {"value": 1},
-        "fid": {"value": 2020},
-        "cls": {"value": None},
-        "fp": {"value": None},
+        "cls": {"unit": "none", "value": None},
+        "fid": {"unit": "millisecond", "value": 2020.0},
+        "inp": {"unit": "millisecond", "value": 100.14},
+        "fp": {"unit": "millisecond", "value": None},
+        "lcp": {"unit": "millisecond", "value": 420.69},
         "missing_value": None,
     }
 
@@ -181,6 +237,7 @@ def test_strip_measurement_interface(
             "measurements": {
                 "LCP": {"value": 420.69},
                 "fid": {"value": 2020},
+                "inp": {"value": 100.14},
                 "cls": {"value": None},
             },
         }
@@ -493,7 +550,7 @@ def test_sample_rates(mini_sentry, relay_chain):
 
     sample_rates = [
         {"id": "client_sampler", "rate": 0.01},
-        {"id": "dyanmic_user", "rate": 0.5},
+        {"id": "dynamic_user", "rate": 0.5},
     ]
 
     envelope = Envelope()
@@ -513,7 +570,7 @@ def test_sample_rates_metrics(mini_sentry, relay_with_processing, events_consume
 
     sample_rates = [
         {"id": "client_sampler", "rate": 0.01},
-        {"id": "dyanmic_user", "rate": 0.5},
+        {"id": "dynamic_user", "rate": 0.5},
     ]
 
     envelope = Envelope()

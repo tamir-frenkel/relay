@@ -1,10 +1,9 @@
 use chrono::Duration;
-use serde::Serialize;
-
 use relay_auth::{
     generate_key_pair, generate_relay_id, PublicKey, RegisterRequest, RegisterResponse, RelayId,
     RelayVersion, SecretKey,
 };
+use serde::Serialize;
 
 use crate::core::{RelayBuf, RelayStr, RelayUuid};
 
@@ -40,7 +39,7 @@ pub unsafe extern "C" fn relay_publickey_parse(s: *const RelayStr) -> *mut Relay
 pub unsafe extern "C" fn relay_publickey_free(spk: *mut RelayPublicKey) {
     if !spk.is_null() {
         let pk = spk as *mut PublicKey;
-        Box::from_raw(pk);
+        let _dropped = Box::from_raw(pk);
     }
 }
 
@@ -92,7 +91,7 @@ pub unsafe extern "C" fn relay_secretkey_parse(s: &RelayStr) -> *mut RelaySecret
 pub unsafe extern "C" fn relay_secretkey_free(spk: *mut RelaySecretKey) {
     if !spk.is_null() {
         let pk = spk as *mut SecretKey;
-        Box::from_raw(pk);
+        let _dropped = Box::from_raw(pk);
     }
 }
 

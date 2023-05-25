@@ -1,8 +1,6 @@
 //! Implements filtering for events originating from legacy browsers.
 
-use std::collections::{BTreeSet, HashMap};
-
-use lazy_static::lazy_static;
+use std::collections::BTreeSet;
 
 use relay_general::protocol::Event;
 use relay_general::user_agent::{self, UserAgent};
@@ -11,11 +9,11 @@ use crate::{FilterStatKey, LegacyBrowser, LegacyBrowsersFilterConfig};
 
 /// Checks if the event originates from legacy browsers.
 pub fn matches(event: &Event, browsers: &BTreeSet<LegacyBrowser>) -> bool {
-    if let Some(user_agent_string) = user_agent::get_user_agent(event) {
+    if let Some(user_agent_string) = user_agent::get_user_agent(&event.request) {
         let user_agent = user_agent::parse_user_agent(user_agent_string);
 
         // remap IE Mobile to IE (sentry python, filter compatibility)
-        let family = match user_agent.family.as_str() {
+        let family = match user_agent.family.as_ref() {
             "IE Mobile" => "IE",
             other => other,
         };
@@ -73,21 +71,6 @@ pub fn should_filter(
     }
 }
 
-lazy_static! {
-    static ref MIN_VERSIONS: HashMap<&'static str, i32> = {
-        let mut x = HashMap::new();
-        x.insert("Chrome", 0);
-        x.insert("IE", 10);
-        x.insert("Firefox", 0);
-        x.insert("Safari", 6);
-        x.insert("Edge", 0);
-        x.insert("Opera", 15);
-        x.insert("Android", 4);
-        x.insert("Opera Mini", 8);
-        x
-    };
-}
-
 fn get_browser_major_version(user_agent: &UserAgent) -> Option<i32> {
     if let Some(browser_major_version_str) = &user_agent.major {
         if let Ok(browser_major_version) = browser_major_version_str.parse::<i32>() {
@@ -98,9 +81,23 @@ fn get_browser_major_version(user_agent: &UserAgent) -> Option<i32> {
     None
 }
 
+fn min_version(family: &str) -> Option<i32> {
+    match family {
+        "Chrome" => Some(0),
+        "IE" => Some(10),
+        "Firefox" => Some(0),
+        "Safari" => Some(6),
+        "Edge" => Some(0),
+        "Opera" => Some(15),
+        "Android" => Some(4),
+        "Opera Mini" => Some(8),
+        _ => None,
+    }
+}
+
 fn default_filter(mapped_family: &str, user_agent: &UserAgent) -> bool {
     if let Some(browser_major_version) = get_browser_major_version(user_agent) {
-        if let Some(&min_version) = MIN_VERSIONS.get(mapped_family) {
+        if let Some(min_version) = min_version(mapped_family) {
             if min_version > browser_major_version {
                 return true;
             }
@@ -153,10 +150,9 @@ mod tests {
     const SAFARI_6_UA: &str =
         "Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10.17.4; en-GB) AppleWebKit/605.1.5 (KHTML, like Gecko) Version/6.0 Safari/605.1.5";
 
-    use super::*;
-
     use std::collections::BTreeSet;
 
+    use super::*;
     use crate::testutils;
 
     fn get_legacy_browsers_config(
@@ -207,8 +203,7 @@ mod tests {
             assert_ne!(
                 filter_result,
                 Ok(()),
-                "Default filter should have filtered User Agent\n{}",
-                old_user_agent
+                "Default filter should have filtered User Agent\n{old_user_agent}"
             )
         }
     }
@@ -230,8 +225,7 @@ mod tests {
             assert_eq!(
                 filter_result,
                 Ok(()),
-                "Default filter shouldn't have filtered User Agent\n{}",
-                old_user_agent
+                "Default filter shouldn't have filtered User Agent\n{old_user_agent}"
             )
         }
     }
@@ -285,9 +279,7 @@ mod tests {
             assert_ne!(
                 filter_result,
                 Ok(()),
-                "Filters {:?} should have filtered User Agent\n{} for ",
-                active_filters,
-                user_agent
+                "Filters {active_filters:?} should have filtered User Agent\n{user_agent} for "
             )
         }
     }
@@ -314,9 +306,7 @@ mod tests {
             assert_eq!(
                 filter_result,
                 Ok(()),
-                "Filter {:?} shouldn't have filtered User Agent\n{} for ",
-                active_filter,
-                user_agent
+                "Filter {active_filter:?} shouldn't have filtered User Agent\n{user_agent} for "
             )
         }
     }
@@ -395,9 +385,7 @@ mod tests {
                 assert_ne!(
                     filter_result,
                     Ok(()),
-                    "Filter <{:?}> should have filtered User Agent\n{} for ",
-                    active_filter,
-                    user_agent
+                    "Filter <{active_filter:?}> should have filtered User Agent\n{user_agent} for "
                 )
             }
         }
@@ -426,9 +414,7 @@ mod tests {
                 assert_eq!(
                     filter_result,
                     Ok(()),
-                    "Filter {:?} shouldn't have filtered User Agent\n{} for ",
-                    active_filter,
-                    user_agent
+                    "Filter {active_filter:?} shouldn't have filtered User Agent\n{user_agent} for "
                 )
             }
         }

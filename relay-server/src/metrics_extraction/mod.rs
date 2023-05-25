@@ -1,6 +1,10 @@
+use relay_common::UnixTimestamp;
+use relay_metrics::Metric;
+
 mod conditional_tagging;
 pub mod sessions;
 pub mod transactions;
-mod utils;
 
-pub use conditional_tagging::TaggingRule;
+pub trait IntoMetric {
+    fn into_metric(self, timestamp: UnixTimestamp) -> Metric;
+}

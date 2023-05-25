@@ -1,7 +1,6 @@
 use std::fmt;
 use std::str::FromStr;
 
-use failure::Fail;
 use pest::error::Error;
 use pest::iterators::Pair;
 use pest::Parser;
@@ -9,24 +8,24 @@ use pest::Parser;
 use crate::processor::{Pii, ProcessingState, ValueType};
 
 /// Error for invalid selectors
-#[derive(Debug, Fail)]
+#[derive(Debug, thiserror::Error)]
 pub enum InvalidSelectorError {
-    #[fail(display = "invalid selector: deep wildcard used more than once")]
+    #[error("invalid selector: deep wildcard used more than once")]
     InvalidDeepWildcard,
 
-    #[fail(display = "invalid selector: wildcard must be part of a path")]
+    #[error("invalid selector: wildcard must be part of a path")]
     InvalidWildcard,
 
-    #[fail(display = "invalid selector: {}", _0)]
-    ParseError(Error<Rule>),
+    #[error("invalid selector: {0}")]
+    ParseError(Box<Error<Rule>>),
 
-    #[fail(display = "invalid selector: invalid index")]
+    #[error("invalid selector: invalid index")]
     InvalidIndex,
 
-    #[fail(display = "invalid selector: unknown value")]
+    #[error("invalid selector: unknown value")]
     UnknownType,
 
-    #[fail(display = "parser bug: consumed {} (expected {})", _0, _1)]
+    #[error("parser bug: consumed {0} (expected {1})")]
     UnexpectedToken(String, &'static str),
 }
 
@@ -53,13 +52,13 @@ pub enum SelectorPathItem {
 impl fmt::Display for SelectorPathItem {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            SelectorPathItem::Type(ty) => write!(f, "${}", ty),
-            SelectorPathItem::Index(index) => write!(f, "{}", index),
+            SelectorPathItem::Type(ty) => write!(f, "${ty}"),
+            SelectorPathItem::Index(index) => write!(f, "{index}"),
             SelectorPathItem::Key(ref key) => {
                 if key_needs_quoting(key) {
                     write!(f, "'{}'", key.replace('\'', "''"))
                 } else {
-                    write!(f, "{}", key)
+                    write!(f, "{key}")
                 }
             }
             SelectorPathItem::Wildcard => write!(f, "*"),
@@ -106,6 +105,7 @@ impl SelectorPathItem {
                         // your new value type.
                         ValueType::Event
                         | ValueType::Attachments
+                        | ValueType::Replay
                         | ValueType::Exception
                         | ValueType::Stacktrace
                         | ValueType::Frame
@@ -157,9 +157,9 @@ impl fmt::Display for SelectorSpec {
                     };
 
                     if needs_parens {
-                        write!(f, "({})", x)?;
+                        write!(f, "({x})")?;
                     } else {
-                        write!(f, "{}", x)?;
+                        write!(f, "{x}")?;
                     }
                 }
             }
@@ -172,7 +172,7 @@ impl fmt::Display for SelectorSpec {
                     // OR has weakest precedence, so everything else binds stronger and does not
                     // need parens
 
-                    write!(f, "{}", x)?;
+                    write!(f, "{x}")?;
                 }
             }
             SelectorSpec::Not(ref x) => {
@@ -184,9 +184,9 @@ impl fmt::Display for SelectorSpec {
                 };
 
                 if needs_parens {
-                    write!(f, "!({})", x)?;
+                    write!(f, "!({x})")?;
                 } else {
-                    write!(f, "!{}", x)?;
+                    write!(f, "!{x}")?;
                 }
             }
             SelectorSpec::Path(ref path) => {
@@ -194,7 +194,7 @@ impl fmt::Display for SelectorSpec {
                     if idx > 0 {
                         write!(f, ".")?;
                     }
-                    write!(f, "{}", item)?;
+                    write!(f, "{item}")?;
                 }
             }
         }
@@ -223,7 +223,7 @@ impl FromStr for SelectorSpec {
 
         handle_selector(
             SelectorParser::parse(Rule::RootSelector, s)
-                .map_err(InvalidSelectorError::ParseError)?
+                .map_err(|e| InvalidSelectorError::ParseError(Box::new(e)))?
                 .next()
                 .unwrap()
                 .into_inner()
@@ -295,7 +295,7 @@ fn handle_selector(pair: Pair<Rule>) -> Result<SelectorSpec, InvalidSelectorErro
             pair.into_inner().next().unwrap(),
         )?))),
         rule => Err(InvalidSelectorError::UnexpectedToken(
-            format!("{:?}", rule),
+            format!("{rule:?}"),
             "a selector",
         )),
     }
@@ -318,7 +318,7 @@ fn handle_selector_path_item(pair: Pair<Rule>) -> Result<SelectorPathItem, Inval
         )),
         Rule::Key => Ok(SelectorPathItem::Key(handle_key(pair)?)),
         rule => Err(InvalidSelectorError::UnexpectedToken(
-            format!("{:?}", rule),
+            format!("{rule:?}"),
             "a selector path item",
         )),
     }
@@ -336,7 +336,7 @@ fn handle_key(pair: Pair<Rule>) -> Result<String, InvalidSelectorError> {
             key
         }),
         rule => Err(InvalidSelectorError::UnexpectedToken(
-            format!("{:?}", rule),
+            format!("{rule:?}"),
             "a key",
         )),
     }

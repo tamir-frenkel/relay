@@ -12,6 +12,7 @@ import pytest
 from .fixtures.gobetween import gobetween  # noqa
 from .fixtures.haproxy import haproxy  # noqa
 from .fixtures.mini_sentry import mini_sentry  # noqa
+from .fixtures.aws_lambda_runtime import aws_lambda_runtime  # noqa
 from .fixtures.relay import relay, get_relay_binary, latest_relay_version  # noqa
 from .fixtures.processing import (
     kafka_consumer,
@@ -22,8 +23,11 @@ from .fixtures.processing import (
     outcomes_consumer,
     transactions_consumer,
     attachments_consumer,
+    replay_recordings_consumer,
     sessions_consumer,
     metrics_consumer,
+    replay_events_consumer,
+    monitors_consumer,
 )  # noqa
 
 
@@ -195,7 +199,7 @@ class _JsonFixtureProvider(object):
 
     def load(self, file_name: str, ext: Optional[str] = None):
         """
-        Loads a fixture with the specified file name (with the path realtive to the current test)
+        Loads a fixture with the specified file name (with the path relative to the current test)
         :param file_name: the file name
         :param ext: an optional extension to be appended to the file name ( the ext should contain
             '.' i.e. it should be something like '.fixture'

@@ -1,14 +1,14 @@
-use failure::Fail;
+use thiserror::Error;
 
 use crate::config::RedisConfig;
 
 /// This is an unconstructable type to make `Option<RedisPool>` zero-sized.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RedisPool;
 
 /// An error returned from `RedisPool`.
-#[derive(Debug, Fail)]
-#[fail(display = "unreachable")]
+#[derive(Debug, Error)]
+#[error("unreachable")]
 pub struct RedisError;
 
 impl RedisPool {

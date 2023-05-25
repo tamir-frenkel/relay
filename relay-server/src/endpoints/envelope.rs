@@ -1,34 +1,112 @@
 //! Handles envelope store requests.
 
-use actix::prelude::*;
-use actix_web::{HttpRequest, HttpResponse};
-use futures::Future;
+use std::convert::Infallible;
+
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, FromRequest};
+use axum::http::Request;
+use axum::response::IntoResponse;
+use axum::routing::{post, MethodRouter};
+use axum::{Json, RequestExt};
+use bytes::Bytes;
+use relay_config::Config;
+use relay_general::protocol::EventId;
 use serde::Serialize;
 
-use relay_general::protocol::EventId;
-
-use crate::body::StoreBody;
 use crate::endpoints::common::{self, BadStoreRequest};
 use crate::envelope::Envelope;
-use crate::extractors::{EnvelopeMeta, RequestMeta};
-use crate::service::{ServiceApp, ServiceState};
+use crate::extractors::{BadEventMeta, PartialMeta, RequestMeta};
+use crate::service::ServiceState;
 
-fn extract_envelope(
-    request: &HttpRequest<ServiceState>,
+/// Aggregate rejection thrown when extracting [`EnvelopeParams`].
+#[derive(Debug)]
+enum BadEnvelopeParams {
+    EventMeta(BadEventMeta),
+    InvalidBody(BytesRejection),
+}
+
+impl From<BadEventMeta> for BadEnvelopeParams {
+    fn from(value: BadEventMeta) -> Self {
+        Self::EventMeta(value)
+    }
+}
+
+impl From<BytesRejection> for BadEnvelopeParams {
+    fn from(value: BytesRejection) -> Self {
+        Self::InvalidBody(value)
+    }
+}
+
+impl From<Infallible> for BadEnvelopeParams {
+    fn from(value: Infallible) -> Self {
+        match value {}
+    }
+}
+
+impl IntoResponse for BadEnvelopeParams {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            BadEnvelopeParams::EventMeta(inner) => inner.into_response(),
+            BadEnvelopeParams::InvalidBody(inner) => inner.into_response(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EnvelopeParams {
     meta: RequestMeta,
-) -> ResponseFuture<Envelope, BadStoreRequest> {
-    let max_payload_size = request.state().config().max_envelope_size();
-    let future = StoreBody::new(request, max_payload_size)
-        .map_err(BadStoreRequest::PayloadError)
-        .and_then(move |data| {
-            if data.is_empty() {
-                return Err(BadStoreRequest::EmptyBody);
-            }
+    body: Bytes,
+}
 
-            Envelope::parse_request(data, meta).map_err(BadStoreRequest::InvalidEnvelope)
-        });
+impl EnvelopeParams {
+    fn extract_envelope(self) -> Result<Box<Envelope>, BadStoreRequest> {
+        let Self { meta, body } = self;
 
-    Box::new(future)
+        if body.is_empty() {
+            return Err(BadStoreRequest::EmptyBody);
+        }
+
+        Ok(Envelope::parse_request(body, meta)?)
+    }
+}
+
+#[axum::async_trait]
+impl<B> FromRequest<ServiceState, B> for EnvelopeParams
+where
+    B: axum::body::HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<axum::BoxError>,
+{
+    type Rejection = BadEnvelopeParams;
+
+    async fn from_request(
+        mut request: Request<B>,
+        state: &ServiceState,
+    ) -> Result<Self, Self::Rejection> {
+        let result = request.extract_parts_with_state(state).await;
+
+        if !matches!(result, Err(BadEventMeta::MissingAuth)) {
+            return Ok(Self {
+                meta: result?,
+                body: request.extract().await?,
+            });
+        }
+
+        let partial_meta = request.extract_parts::<PartialMeta>().await?;
+        let body: Bytes = request.extract().await?;
+
+        let line = body
+            .splitn(2, |b| *b == b'\n')
+            .next()
+            .ok_or(BadEventMeta::MissingAuth)?;
+
+        let request_meta = serde_json::from_slice(line).map_err(BadEventMeta::BadEnvelopeAuth)?;
+
+        Ok(Self {
+            meta: partial_meta.copy_to(request_meta),
+            body,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -37,24 +115,21 @@ struct StoreResponse {
     id: Option<EventId>,
 }
 
-fn create_response(id: Option<EventId>) -> HttpResponse {
-    HttpResponse::Ok().json(StoreResponse { id })
-}
-
 /// Handler for the envelope store endpoint.
-fn store_envelope(
-    envelope_meta: EnvelopeMeta,
-    request: HttpRequest<ServiceState>,
-) -> ResponseFuture<HttpResponse, BadStoreRequest> {
-    let meta = envelope_meta.into_inner();
-    common::handle_store_like_request(meta, request, extract_envelope, create_response, true)
+async fn handle(
+    state: ServiceState,
+    params: EnvelopeParams,
+) -> Result<impl IntoResponse, BadStoreRequest> {
+    let envelope = params.extract_envelope()?;
+    let id = common::handle_envelope(&state, envelope).await?;
+    Ok(Json(StoreResponse { id }))
 }
 
-pub fn configure_app(app: ServiceApp) -> ServiceApp {
-    common::cors(app)
-        .resource(&common::normpath(r"/api/{project:\d+}/envelope/"), |r| {
-            r.name("store-envelope");
-            r.post().with(store_envelope);
-        })
-        .register()
+pub fn route<B>(config: &Config) -> MethodRouter<ServiceState, B>
+where
+    B: axum::body::HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<axum::BoxError>,
+{
+    post(handle).route_layer(DefaultBodyLimit::max(config.max_envelope_size()))
 }

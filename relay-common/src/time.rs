@@ -129,8 +129,8 @@ impl UnixTimestamp {
     }
 
     /// Returns the timestamp as chrono datetime.
-    pub fn as_datetime(self) -> DateTime<Utc> {
-        DateTime::from_utc(NaiveDateTime::from_timestamp(self.0 as i64, 0), Utc)
+    pub fn as_datetime(self) -> Option<DateTime<Utc>> {
+        NaiveDateTime::from_timestamp_opt(self.0 as i64, 0).map(|n| DateTime::from_utc(n, Utc))
     }
 
     /// Converts the UNIX timestamp into an `Instant` based on the current system timestamp.
@@ -270,8 +270,9 @@ impl<'de> Deserialize<'de> for UnixTimestamp {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_test::{assert_de_tokens, assert_de_tokens_error, assert_tokens, Token};
+
+    use super::*;
 
     #[test]
     fn test_parse_timestamp_int() {

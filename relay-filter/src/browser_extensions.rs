@@ -1,11 +1,74 @@
 //! Implements filtering for events caused by problematic browsers extensions.
 
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use regex::Regex;
-
 use relay_general::protocol::{Event, Exception};
 
 use crate::{FilterConfig, FilterStatKey};
+
+static EXTENSION_EXC_VALUES: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?ix)
+        # Random plugins/extensions
+        top\.GLOBALS|
+        # See: http://blog.errorception.com/2012/03/tale-of-unfindable-js-error.html
+        originalCreateNotification|
+        canvas.contentDocument|
+        MyApp_RemoveAllHighlights|
+        http://tt\.epicplay\.com|
+        Can't\sfind\svariable:\sZiteReader|
+        jigsaw\sis\snot\sdefined|
+        ComboSearch\sis\snot\sdefined|
+        http://loading\.retry\.widdit\.com/|
+        atomicFindClose|
+        # Facebook borked
+        fb_xd_fragment|
+        # ISP "optimizing" proxy - `Cache-Control: no-transform` seems to
+        # reduce this. (thanks @acdha)
+        # See http://stackoverflow.com/questions/4113268
+        bmi_SafeAddOnload|
+        EBCallBackMessageReceived|
+        # See https://groups.google.com/a/chromium.org/forum/#!topic/chromium-discuss/7VU0_VvC7mE
+         _gCrWeb|
+         # See http://toolbar.conduit.com/Debveloper/HtmlAndGadget/Methods/JSInjection.aspx
+        conduitPage|
+        # Google Search app (iOS)
+        # See: https://github.com/getsentry/raven-js/issues/756
+        null\sis\snot\san\sobject\s\(evaluating\s'elt.parentNode'\)|
+        # Dragon Web Extension from Nuance Communications
+        # See: https://forum.sentry.io/t/error-in-raven-js-plugin-setsuspendstate/481/
+        plugin\.setSuspendState\sis\snot\sa\sfunction|
+        # Chrome extension message passing failure
+        Extension\scontext\sinvalidated
+    "#,
+    )
+    .expect("Invalid browser extensions filter (Exec Vals) Regex")
+});
+
+static EXTENSION_EXC_SOURCES: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?ix)
+        graph\.facebook\.com|                           # Facebook flakiness
+        connect\.facebook\.net|                         # Facebook blocked
+        eatdifferent\.com\.woopra-ns\.com|              # Woopra flakiness
+        static\.woopra\.com/js/woopra\.js|
+        ^chrome(-extension)?://|                        # Chrome extensions
+        ^moz-extension://|                              # Firefox extensions
+        ^safari(-web)?-extension://|                    # Safari extensions
+        127\.0\.0\.1:4001/isrunning|                    # Cacaoweb
+        webappstoolbarba\.texthelp\.com/|               # Other
+        metrics\.itunes\.apple\.com\.edgesuite\.net/|
+        kaspersky-labs\.com                             # Kaspersky Protection browser extension
+    "#,
+    )
+    .expect("Invalid browser extensions filter (Exec Sources) Regex")
+});
+
+/// Frames which do not have defined function, method or type name. Or frames which come from the
+/// native V8 code.
+///
+/// These frames do not give us any information about the exception source and can be ignored.
+const ANONYMOUS_FRAMES: [&str; 2] = ["<anonymous>", "[native code]"];
 
 /// Check if the event originates from known problematic browser extensions.
 pub fn matches(event: &Event) -> bool {
@@ -49,71 +112,23 @@ fn get_exception_value(event: &Event) -> Option<&str> {
 fn get_exception_source(event: &Event) -> Option<&str> {
     let exception = get_first_exception(event)?;
     let frames = exception.stacktrace.value()?.frames.value()?;
-    let last_frame = frames.last()?.value()?;
-    Some(last_frame.abs_path.value()?.as_str())
-}
-
-lazy_static! {
-    static ref EXTENSION_EXC_VALUES: Regex = Regex::new(
-        r#"(?ix)
-        # Random plugins/extensions
-        top\.GLOBALS|
-        # See: http://blog.errorception.com/2012/03/tale-of-unfindable-js-error.html
-        originalCreateNotification|
-        canvas.contentDocument|
-        MyApp_RemoveAllHighlights|
-        http://tt\.epicplay\.com|
-        Can't\sfind\svariable:\sZiteReader|
-        jigsaw\sis\snot\sdefined|
-        ComboSearch\sis\snot\sdefined|
-        http://loading\.retry\.widdit\.com/|
-        atomicFindClose|
-        # Facebook borked
-        fb_xd_fragment|
-        # ISP "optimizing" proxy - `Cache-Control: no-transform` seems to
-        # reduce this. (thanks @acdha)
-        # See http://stackoverflow.com/questions/4113268
-        bmi_SafeAddOnload|
-        EBCallBackMessageReceived|
-        # See https://groups.google.com/a/chromium.org/forum/#!topic/chromium-discuss/7VU0_VvC7mE
-         _gCrWeb|
-         # See http://toolbar.conduit.com/Debveloper/HtmlAndGadget/Methods/JSInjection.aspx
-        conduitPage|
-        # Google Search app (iOS)
-        # See: https://github.com/getsentry/raven-js/issues/756
-        null\sis\snot\san\sobject\s\(evaluating\s'elt.parentNode'\)|
-        # Dragon Web Extension from Nuance Communications
-        # See: https://forum.sentry.io/t/error-in-raven-js-plugin-setsuspendstate/481/
-        plugin\.setSuspendState\sis\snot\sa\sfunction|
-        # Chrome extension message passing failure
-        Extension\scontext\sinvalidated
-    "#
-    )
-    .expect("Invalid browser extensions filter (Exec Vals) Regex");
-    static ref EXTENSION_EXC_SOURCES: Regex = Regex::new(
-        r#"(?ix)
-        graph\.facebook\.com|                           # Facebook flakiness
-        connect\.facebook\.net|                         # Facebook blocked
-        eatdifferent\.com\.woopra-ns\.com|              # Woopra flakiness
-        static\.woopra\.com/js/woopra\.js|
-        ^chrome(-extension)?://|                        # Chrome extensions
-        ^moz-extension://|                              # Firefox extensions
-        ^safari(-web)?-extension://|                    # Safari extensions
-        127\.0\.0\.1:4001/isrunning|                    # Cacaoweb
-        webappstoolbarba\.texthelp\.com/|               # Other
-        metrics\.itunes\.apple\.com\.edgesuite\.net/|
-        kaspersky-labs\.com                             # Kaspersky Protection browser extension
-    "#
-    )
-    .expect("Invalid browser extensions filter (Exec Sources) Regex");
+    // Iterate from the tail and get the first frame which is not anonymous.
+    for f in frames.iter().rev() {
+        let abs_path = f.value()?.abs_path.value()?;
+        let path = abs_path.as_str();
+        if !ANONYMOUS_FRAMES.contains(&path) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use relay_general::protocol::{Frame, JsonLenientString, RawStacktrace, Stacktrace, Values};
     use relay_general::types::Annotated;
+
+    use super::*;
 
     /// Returns an event with the specified exception on the last position in the stack.
     fn get_event_with_exception(e: Exception) -> Event {
@@ -135,10 +150,20 @@ mod tests {
     fn get_event_with_exception_source(src: &str) -> Event {
         let ex = Exception {
             stacktrace: Annotated::from(Stacktrace(RawStacktrace {
-                frames: Annotated::new(vec![Annotated::new(Frame {
-                    abs_path: Annotated::new(src.into()),
-                    ..Frame::default()
-                })]),
+                frames: Annotated::new(vec![
+                    Annotated::new(Frame {
+                        abs_path: Annotated::new(src.into()),
+                        ..Frame::default()
+                    }),
+                    Annotated::new(Frame {
+                        abs_path: Annotated::new("<anonymous>".into()),
+                        ..Frame::default()
+                    }),
+                    Annotated::new(Frame {
+                        abs_path: Annotated::new("<anonymous>".into()),
+                        ..Frame::default()
+                    }),
+                ]),
                 ..RawStacktrace::default()
             })),
             ..Exception::default()
@@ -197,8 +222,7 @@ mod tests {
             assert_ne!(
                 filter_result,
                 Ok(()),
-                "Event filter not recognizing events with known source {}",
-                source_name
+                "Event filter not recognizing events with known source {source_name}"
             )
         }
     }
@@ -234,8 +258,7 @@ mod tests {
             assert_ne!(
                 filter_result,
                 Ok(()),
-                "Event filter not recognizing events with known values {}",
-                exc_value
+                "Event filter not recognizing events with known values {exc_value}"
             )
         }
     }

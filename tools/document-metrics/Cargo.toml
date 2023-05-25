@@ -5,17 +5,16 @@ authors = ["Sentry <oss@sentry.io>"]
 description = "Generates documentation for metrics"
 homepage = "https://getsentry.github.io/relay/"
 repository = "https://github.com/getsentry/relay"
-edition = "2018"
+edition = "2021"
 publish = false
 
 [dependencies]
 anyhow = "1.0.32"
-paw = "1.0.0"
+clap = { version = "4.1.4", features = ["derive"] }
 serde = { version = "1.0.114", features = ["derive"] }
 serde_json = "1.0.55"
-serde_yaml = "0.8.13"
-structopt = { version = "0.3.16", features = ["paw"] }
+serde_yaml = "0.9.17"
 syn = "1.0.39"
 
 [dev-dependencies]
-insta = "1.1.0"
+insta = "1.19.0"

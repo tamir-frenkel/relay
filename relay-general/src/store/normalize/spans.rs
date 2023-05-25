@@ -141,13 +141,15 @@ fn compute_span_exclusive_time(event: &mut Event) {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeZone, Utc};
+    use similar_asserts::assert_eq;
+
     use super::*;
     use crate::protocol::{
         Context, ContextInner, Contexts, Event, EventType, Span, SpanId, Timestamp, TraceContext,
         TraceId,
     };
     use crate::types::Object;
-    use chrono::{TimeZone, Utc};
 
     fn make_event(
         start: Timestamp,
@@ -235,35 +237,31 @@ mod tests {
     #[test]
     fn test_skip_exclusive_time() {
         let mut event = make_event(
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 0, 0).into(),
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 5, 0).into(),
+            Utc.timestamp_opt(1609455600, 0).unwrap().into(),
+            Utc.timestamp_opt(1609455605, 0).unwrap().into(),
             "aaaaaaaaaaaaaaaa",
             vec![
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 1, 0).into(),
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 4, 0).into(),
+                    Utc.timestamp_opt(1609455601, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455604, 0).unwrap().into(),
                     "bbbbbbbbbbbbbbbb",
                     "aaaaaaaaaaaaaaaa",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 1, 0).into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 3, 500_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455601, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455603, 500_000_000).unwrap().into(),
                     "cccccccccccccccc",
                     "aaaaaaaaaaaaaaaa",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 3, 0).into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 4, 877_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455603, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455604, 877_000_000).unwrap().into(),
                     "dddddddddddddddd",
                     "aaaaaaaaaaaaaaaa",
                 ),
@@ -301,35 +299,31 @@ mod tests {
     #[test]
     fn test_childless_spans() {
         let mut event = make_event(
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 0, 0).into(),
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 5, 0).into(),
+            Utc.timestamp_opt(1609455600, 0).unwrap().into(),
+            Utc.timestamp_opt(1609455605, 0).unwrap().into(),
             "aaaaaaaaaaaaaaaa",
             vec![
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 1, 0).into(),
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 4, 0).into(),
+                    Utc.timestamp_opt(1609455601, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455604, 0).unwrap().into(),
                     "bbbbbbbbbbbbbbbb",
                     "aaaaaaaaaaaaaaaa",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 1, 0).into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 3, 500_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455601, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455603, 500_000_000).unwrap().into(),
                     "cccccccccccccccc",
                     "aaaaaaaaaaaaaaaa",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 3, 0).into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 4, 877_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455603, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455604, 877_000_000).unwrap().into(),
                     "dddddddddddddddd",
                     "aaaaaaaaaaaaaaaa",
                 ),
@@ -360,39 +354,31 @@ mod tests {
     #[test]
     fn test_nested_spans() {
         let mut event = make_event(
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 0, 0).into(),
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 5, 0).into(),
+            Utc.timestamp_opt(1609455600, 0).unwrap().into(),
+            Utc.timestamp_opt(1609455605, 0).unwrap().into(),
             "aaaaaaaaaaaaaaaa",
             vec![
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 1, 0).into(),
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 2, 0).into(),
+                    Utc.timestamp_opt(1609455601, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455602, 0).unwrap().into(),
                     "bbbbbbbbbbbbbbbb",
                     "aaaaaaaaaaaaaaaa",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 200_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 800_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455601, 200_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455601, 800_000_000).unwrap().into(),
                     "cccccccccccccccc",
                     "bbbbbbbbbbbbbbbb",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 400_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 600_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455601, 400_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455601, 600_000_000).unwrap().into(),
                     "dddddddddddddddd",
                     "cccccccccccccccc",
                 ),
@@ -423,39 +409,31 @@ mod tests {
     #[test]
     fn test_overlapping_child_spans() {
         let mut event = make_event(
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 0, 0).into(),
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 5, 0).into(),
+            Utc.timestamp_opt(1609455600, 0).unwrap().into(),
+            Utc.timestamp_opt(1609455605, 0).unwrap().into(),
             "aaaaaaaaaaaaaaaa",
             vec![
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 1, 0).into(),
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 2, 0).into(),
+                    Utc.timestamp_opt(1609455601, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455602, 0).unwrap().into(),
                     "bbbbbbbbbbbbbbbb",
                     "aaaaaaaaaaaaaaaa",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 200_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 600_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455601, 200_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455601, 600_000_000).unwrap().into(),
                     "cccccccccccccccc",
                     "bbbbbbbbbbbbbbbb",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 400_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 800_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455601, 400_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455601, 800_000_000).unwrap().into(),
                     "dddddddddddddddd",
                     "bbbbbbbbbbbbbbbb",
                 ),
@@ -486,39 +464,31 @@ mod tests {
     #[test]
     fn test_child_spans_dont_intersect_parent() {
         let mut event = make_event(
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 0, 0).into(),
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 5, 0).into(),
+            Utc.timestamp_opt(1609455600, 0).unwrap().into(),
+            Utc.timestamp_opt(1609455605, 0).unwrap().into(),
             "aaaaaaaaaaaaaaaa",
             vec![
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 1, 0).into(),
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 2, 0).into(),
+                    Utc.timestamp_opt(1609455601, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455602, 0).unwrap().into(),
                     "bbbbbbbbbbbbbbbb",
                     "aaaaaaaaaaaaaaaa",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 0, 400_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 0, 800_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455600, 400_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455600, 800_000_000).unwrap().into(),
                     "cccccccccccccccc",
                     "bbbbbbbbbbbbbbbb",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 2, 200_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 2, 600_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455602, 200_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455602, 600_000_000).unwrap().into(),
                     "dddddddddddddddd",
                     "bbbbbbbbbbbbbbbb",
                 ),
@@ -549,39 +519,31 @@ mod tests {
     #[test]
     fn test_child_spans_extend_beyond_parent() {
         let mut event = make_event(
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 0, 0).into(),
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 5, 0).into(),
+            Utc.timestamp_opt(1609455600, 0).unwrap().into(),
+            Utc.timestamp_opt(1609455605, 0).unwrap().into(),
             "aaaaaaaaaaaaaaaa",
             vec![
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 1, 0).into(),
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 2, 0).into(),
+                    Utc.timestamp_opt(1609455601, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455602, 0).unwrap().into(),
                     "bbbbbbbbbbbbbbbb",
                     "aaaaaaaaaaaaaaaa",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 0, 800_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 400_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455600, 800_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455601, 400_000_000).unwrap().into(),
                     "cccccccccccccccc",
                     "bbbbbbbbbbbbbbbb",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 600_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 2, 200_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455601, 600_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455602, 200_000_000).unwrap().into(),
                     "dddddddddddddddd",
                     "bbbbbbbbbbbbbbbb",
                 ),
@@ -612,39 +574,31 @@ mod tests {
     #[test]
     fn test_child_spans_consumes_all_of_parent() {
         let mut event = make_event(
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 0, 0).into(),
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 5, 0).into(),
+            Utc.timestamp_opt(1609455600, 0).unwrap().into(),
+            Utc.timestamp_opt(1609455605, 0).unwrap().into(),
             "aaaaaaaaaaaaaaaa",
             vec![
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 1, 0).into(),
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 2, 0).into(),
+                    Utc.timestamp_opt(1609455601, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455602, 0).unwrap().into(),
                     "bbbbbbbbbbbbbbbb",
                     "aaaaaaaaaaaaaaaa",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 0, 800_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 600_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455600, 800_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455601, 600_000_000).unwrap().into(),
                     "cccccccccccccccc",
                     "bbbbbbbbbbbbbbbb",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 400_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 2, 200_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455601, 400_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455602, 200_000_000).unwrap().into(),
                     "dddddddddddddddd",
                     "bbbbbbbbbbbbbbbb",
                 ),
@@ -675,27 +629,23 @@ mod tests {
     #[test]
     fn test_only_immediate_child_spans_affect_calculation() {
         let mut event = make_event(
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 0, 0).into(),
-            Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 5, 0).into(),
+            Utc.timestamp_opt(1609455600, 0).unwrap().into(),
+            Utc.timestamp_opt(1609455605, 0).unwrap().into(),
             "aaaaaaaaaaaaaaaa",
             vec![
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 1, 0).into(),
-                    Utc.ymd(2021, 1, 1).and_hms_nano(0, 0, 2, 0).into(),
+                    Utc.timestamp_opt(1609455601, 0).unwrap().into(),
+                    Utc.timestamp_opt(1609455602, 0).unwrap().into(),
                     "bbbbbbbbbbbbbbbb",
                     "aaaaaaaaaaaaaaaa",
                 ),
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 600_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 2, 200_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455601, 600_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455602, 200_000_000).unwrap().into(),
                     "cccccccccccccccc",
                     "bbbbbbbbbbbbbbbb",
                 ),
@@ -704,12 +654,8 @@ mod tests {
                 make_span(
                     "db",
                     "SELECT * FROM table;",
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 400_000_000)
-                        .into(),
-                    Utc.ymd(2021, 1, 1)
-                        .and_hms_nano(0, 0, 1, 800_000_000)
-                        .into(),
+                    Utc.timestamp_opt(1609455601, 400_000_000).unwrap().into(),
+                    Utc.timestamp_opt(1609455601, 800_000_000).unwrap().into(),
                     "dddddddddddddddd",
                     "cccccccccccccccc",
                 ),

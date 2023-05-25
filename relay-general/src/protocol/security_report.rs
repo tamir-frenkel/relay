@@ -11,6 +11,7 @@ use serde::de::{Error, IgnoredAny};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::macros::derive_fromstr_and_display;
 use crate::protocol::{
     Event, HeaderName, HeaderValue, Headers, LogEntry, PairList, Request, TagEntry, Tags,
 };
@@ -138,9 +139,9 @@ fn schema_uses_host(schema: &str) -> bool {
 /// Mimicks Python's urlunsplit with all its quirks.
 fn unsplit_uri(schema: &str, host: &str) -> String {
     if !host.is_empty() || schema_uses_host(schema) {
-        format!("{}://{}", schema, host)
+        format!("{schema}://{host}")
     } else if !schema.is_empty() {
-        format!("{}:{}", schema, host)
+        format!("{schema}:{host}")
     } else {
         String::new()
     }
@@ -170,7 +171,7 @@ fn normalize_uri(value: &str) -> Cow<'_, str> {
     };
 
     Cow::Owned(match url.port() {
-        Some(port) => format!("{}:{}", normalized, port),
+        Some(port) => format!("{normalized}:{port}"),
         None => normalized.into_owned(),
     })
 }
@@ -182,7 +183,7 @@ fn normalize_uri(value: &str) -> Cow<'_, str> {
 #[serde(rename_all = "kebab-case")]
 struct CspRaw {
     #[serde(skip_serializing_if = "Option::is_none")]
-    effective_directive: Option<CspDirective>,
+    effective_directive: Option<String>,
     #[serde(default = "CspRaw::default_blocked_uri")]
     blocked_uri: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -217,20 +218,31 @@ impl CspRaw {
 
     fn effective_directive(&self) -> Result<CspDirective, InvalidSecurityError> {
         // Firefox doesn't send effective-directive, so parse it from
-        // violated-directive but prefer effective-directive when present
-        //
+        // violated-directive but prefer effective-directive when present.
         // refs: https://bugzil.la/1192684#c8
 
-        if let Some(directive) = self.effective_directive {
-            return Ok(directive);
+        if let Some(directive) = &self.effective_directive {
+            // In C2P1 and CSP2, violated_directive and possibly effective_directive might contain
+            // more information than just the CSP-directive.
+            if let Ok(parsed_directive) = directive
+                .split_once(' ')
+                .map_or(directive.as_str(), |s| s.0)
+                .parse()
+            {
+                return Ok(parsed_directive);
+            }
         }
 
-        self.violated_directive
+        if let Ok(parsed_directive) = self
+            .violated_directive
             .split_once(' ')
-            .map_or(&*self.violated_directive, |x| x.0)
+            .map_or(self.violated_directive.as_str(), |s| s.0)
             .parse()
-            .ok()
-            .ok_or(InvalidSecurityError)
+        {
+            Ok(parsed_directive)
+        } else {
+            Err(InvalidSecurityError)
+        }
     }
 
     fn get_message(&self, effective_directive: CspDirective) -> String {
@@ -257,29 +269,29 @@ impl CspRaw {
                         "Blocked unsafe (eval() or inline) 'script'".to_string()
                     }
                 }
-                directive => format!("Blocked inline '{}'", directive),
+                directive => format!("Blocked inline '{directive}'"),
             }
         } else {
             let uri = normalize_uri(&self.blocked_uri);
 
             match effective_directive {
-                CspDirective::ChildSrc => format!("Blocked 'child' from '{}'", uri),
-                CspDirective::ConnectSrc => format!("Blocked 'connect' from '{}'", uri),
-                CspDirective::FontSrc => format!("Blocked 'font' from '{}'", uri),
-                CspDirective::FormAction => format!("Blocked 'form' action to '{}'", uri),
-                CspDirective::ImgSrc => format!("Blocked 'image' from '{}'", uri),
-                CspDirective::ManifestSrc => format!("Blocked 'manifest' from '{}'", uri),
-                CspDirective::MediaSrc => format!("Blocked 'media' from '{}'", uri),
-                CspDirective::ObjectSrc => format!("Blocked 'object' from '{}'", uri),
-                CspDirective::ScriptSrc => format!("Blocked 'script' from '{}'", uri),
+                CspDirective::ChildSrc => format!("Blocked 'child' from '{uri}'"),
+                CspDirective::ConnectSrc => format!("Blocked 'connect' from '{uri}'"),
+                CspDirective::FontSrc => format!("Blocked 'font' from '{uri}'"),
+                CspDirective::FormAction => format!("Blocked 'form' action to '{uri}'"),
+                CspDirective::ImgSrc => format!("Blocked 'image' from '{uri}'"),
+                CspDirective::ManifestSrc => format!("Blocked 'manifest' from '{uri}'"),
+                CspDirective::MediaSrc => format!("Blocked 'media' from '{uri}'"),
+                CspDirective::ObjectSrc => format!("Blocked 'object' from '{uri}'"),
+                CspDirective::ScriptSrc => format!("Blocked 'script' from '{uri}'"),
                 CspDirective::ScriptSrcAttr => {
-                    format!("Blocked inline script attribute from '{}'", uri)
+                    format!("Blocked inline script attribute from '{uri}'")
                 }
-                CspDirective::ScriptSrcElem => format!("Blocked 'script' from '{}'", uri),
-                CspDirective::StyleSrc => format!("Blocked 'style' from '{}'", uri),
-                CspDirective::StyleSrcElem => format!("Blocked 'style' from '{}'", uri),
-                CspDirective::StyleSrcAttr => format!("Blocked style attribute from '{}'", uri),
-                directive => format!("Blocked '{}' from '{}'", directive, uri),
+                CspDirective::ScriptSrcElem => format!("Blocked 'script' from '{uri}'"),
+                CspDirective::StyleSrc => format!("Blocked 'style' from '{uri}'"),
+                CspDirective::StyleSrcElem => format!("Blocked 'style' from '{uri}'"),
+                CspDirective::StyleSrcAttr => format!("Blocked style attribute from '{uri}'"),
+                directive => format!("Blocked '{directive}' from '{uri}'"),
             }
         }
     }
@@ -563,8 +575,9 @@ struct ExpectCtRaw {
 }
 
 mod serde_date_time_3339 {
-    use super::*;
     use serde::de::Visitor;
+
+    use super::*;
 
     pub fn serialize<S>(date_time: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1082,6 +1095,7 @@ impl SecurityReportType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutils::assert_annotated_snapshot;
 
     #[test]
     fn test_unsplit_uri() {
@@ -1924,5 +1938,40 @@ mod tests {
             csp_raw.effective_directive(),
             Ok(CspDirective::DefaultSrc)
         ));
+    }
+
+    #[test]
+    fn test_extract_effective_directive_from_long_form() {
+        // First try from 'effective-directive' field
+        let json = r#"{
+            "csp-report": {
+                "document-uri": "http://example.com/foo",
+                "effective-directive": "script-src 'report-sample' 'strict-dynamic' 'unsafe-eval' 'nonce-random" ,
+                "blocked-uri": "data"
+            }
+        }"#;
+
+        let raw_report = serde_json::from_slice::<CspReportRaw>(json.as_bytes()).unwrap();
+        let raw_csp = raw_report.csp_report;
+
+        let effective_directive = raw_csp.effective_directive().unwrap();
+
+        assert_eq!(effective_directive, CspDirective::ScriptSrc);
+
+        // Then from 'violated-directive' field
+        let json = r#"{
+            "csp-report": {
+                "document-uri": "http://example.com/foo",
+                "violated-directive": "script-src 'report-sample' 'strict-dynamic' 'unsafe-eval' 'nonce-random" ,
+                "blocked-uri": "data"
+            }
+        }"#;
+
+        let raw_report = serde_json::from_slice::<CspReportRaw>(json.as_bytes()).unwrap();
+        let raw_csp = raw_report.csp_report;
+
+        let effective_directive = raw_csp.effective_directive().unwrap();
+
+        assert_eq!(effective_directive, CspDirective::ScriptSrc);
     }
 }

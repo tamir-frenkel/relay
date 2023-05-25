@@ -2,11 +2,14 @@
 Tests the project_configs endpoint (/api/0/relays/projectconfigs/)
 """
 
-import json
 import uuid
 import pytest
 import time
+from requests.exceptions import HTTPError
+import queue
 from collections import namedtuple
+import tempfile
+import os
 
 from sentry_relay import PublicKey, SecretKey, generate_key_pair
 
@@ -15,7 +18,11 @@ RelayInfo = namedtuple("RelayInfo", ["id", "public_key", "secret_key", "internal
 
 @pytest.mark.parametrize(
     "caller, projects",
-    [("r2", ["p2"]), ("sr1", ["p1", "p2", "p3", "p4"]), ("sr2", ["p4"]),],
+    [
+        ("r2", ["p2"]),
+        ("sr1", ["p1", "p2", "p3", "p4"]),
+        ("sr2", ["p4"]),
+    ],
     ids=[
         "dyn external relay fetches proj info",
         "static internal relay fetches proj info",
@@ -34,9 +41,12 @@ def test_dynamic_relays(mini_sentry, relay, caller, projects):
         id2: {"public_key": str(pk2), "internal": False},
     }
 
-    relay1 = relay(mini_sentry, wait_healthcheck=True, static_relays=relays_conf)
+    relay1 = relay(mini_sentry, wait_health_check=True, static_relays=relays_conf)
     relay2 = relay(
-        mini_sentry, wait_healthcheck=True, external=True, static_relays=relays_conf,
+        mini_sentry,
+        wait_health_check=True,
+        external=True,
+        static_relays=relays_conf,
     )
 
     # create info for our test parameters
@@ -98,7 +108,7 @@ def test_dynamic_relays(mini_sentry, relay, caller, projects):
 
 
 def test_invalid_json(mini_sentry, relay):
-    relay = relay(mini_sentry, wait_healthcheck=True)
+    relay = relay(mini_sentry, wait_health_check=True)
 
     body = {}  # missing the required `publicKeys` field
     packed, signature = SecretKey.parse(relay.secret_key).pack(body)
@@ -117,7 +127,7 @@ def test_invalid_json(mini_sentry, relay):
 
 
 def test_invalid_signature(mini_sentry, relay):
-    relay = relay(mini_sentry, wait_healthcheck=True)
+    relay = relay(mini_sentry, wait_health_check=True)
 
     response = relay.post(
         "/api/0/relays/projectconfigs/?version=2",
@@ -133,7 +143,7 @@ def test_invalid_signature(mini_sentry, relay):
 
 
 def test_broken_projectkey(mini_sentry, relay):
-    relay = relay(mini_sentry, wait_healthcheck=True)
+    relay = relay(mini_sentry, wait_health_check=True)
     mini_sentry.add_basic_project_config(42)
     public_key = mini_sentry.get_dsn_public_key(42)
 
@@ -164,7 +174,7 @@ def test_pending_projects(mini_sentry, relay):
     # V3 requests will never return a projectconfig on the first request, only some
     # subsequent request will contain the response.  However if the machine executing this
     # test is very slow this could still be a flaky test.
-    relay = relay(mini_sentry, wait_healthcheck=True)
+    relay = relay(mini_sentry, wait_health_check=True)
     project = mini_sentry.add_basic_project_config(42)
     public_key = mini_sentry.get_dsn_public_key(42)
 
@@ -201,3 +211,218 @@ def test_pending_projects(mini_sentry, relay):
     print(data)
     assert public_key in data["configs"]
     assert data.get("pending") is None
+
+
+def request_config(relay, packed, signature):
+    return relay.post(
+        "/api/0/relays/projectconfigs/?version=3",
+        data=packed,
+        headers={
+            "X-Sentry-Relay-Id": relay.relay_id,
+            "X-Sentry-Relay-Signature": signature,
+        },
+    )
+
+
+def get_response(relay, packed, signature):
+    data = None
+    deadline = time.monotonic() + 15
+    while time.monotonic() <= deadline:
+        # send 1 r/s
+        time.sleep(1)
+        response = request_config(relay, packed, signature)
+        assert response.ok
+        data = response.json()
+        if data["configs"]:
+            break
+    else:
+        print("Relay did still not receive a project config from minisentry")
+    return data
+
+
+@pytest.mark.parametrize(
+    "buffer_config",
+    [False, True],
+)
+def test_unparsable_project_config(buffer_config, mini_sentry, relay):
+    project_key = 42
+    relay_config = {
+        "cache": {
+            "project_expiry": 2,
+            "project_grace_period": 20,
+            "miss_expiry": 2,
+        },
+        "http": {"max_retry_interval": 1},
+    }
+
+    if buffer_config:
+        temp = tempfile.mkdtemp()
+        dbfile = os.path.join(temp, "buffer.db")
+        # set the buffer to something low to force the spooling
+        relay_config["spool"] = {"envelopes": {"path": dbfile, "max_memory_size": 1000}}
+
+    relay = relay(mini_sentry, relay_config, wait_health_check=True)
+    mini_sentry.add_full_project_config(project_key)
+    public_key = mini_sentry.get_dsn_public_key(project_key)
+
+    # Config is broken and will produce the invalid project state.
+    config = mini_sentry.project_configs[project_key]["config"]
+    ds = config.setdefault("dynamicSampling", {})
+    ds.setdefault("rules", [])
+    ds.setdefault("rulesV2", []).append(
+        {
+            "condition": {
+                "op": "and",
+                "inner": [
+                    {"op": "glob", "name": "releases", "value": ["1.1.1", "1.1.2"]}
+                ],
+            },
+            "samplingValue": {"strategy": "sampleRate", "value": 0.7},
+            "type": "trace",
+            "id": 1,
+            "timeRange": {
+                "start": "2022-10-10T00:00:00.000000Z",
+                "end": "2022-10-20T00:00:00.000000Z",
+            },
+            "decayingFn": {"function": "linear", "decayedSampleRate": 0.9},
+        }
+    )
+
+    body = {"publicKeys": [public_key]}
+    packed, signature = SecretKey.parse(relay.secret_key).pack(body)
+
+    # This request should return invalid project state and also send the error to Sentry.
+    data = get_response(relay, packed, signature)
+    assert {
+        "configs": {
+            public_key: {
+                "projectId": None,
+                "lastChange": None,
+                "disabled": True,
+                "publicKeys": [],
+                "slug": None,
+                "config": {
+                    "allowedDomains": ["*"],
+                    "trustedRelays": [],
+                    "piiConfig": None,
+                },
+                "organizationId": None,
+            }
+        }
+    } == data
+
+    try:
+        relay.send_event(project_key)
+        assert {str(e) for _, e in mini_sentry.test_failures} == {
+            f"Relay sent us event: error fetching project state {public_key}: missing field `type`",
+        }
+    finally:
+        mini_sentry.test_failures.clear()
+
+    # Fix the config.
+    config = mini_sentry.project_configs[project_key]["config"]
+    config["dynamicSampling"]["rules"] = []
+    config["dynamicSampling"]["rulesV2"] = [
+        {
+            "condition": {
+                "op": "and",
+                "inner": [
+                    {"op": "glob", "name": "releases", "value": ["1.1.1", "1.1.2"]}
+                ],
+            },
+            "samplingValue": {"type": "sampleRate", "value": 0.7},
+            "type": "trace",
+            "id": 1,
+            "timeRange": {
+                "start": "2022-10-10T00:00:00.000000Z",
+                "end": "2022-10-20T00:00:00.000000Z",
+            },
+            "decayingFn": {"type": "linear", "decayedValue": 0.9},
+        }
+    ]
+
+    relay.send_event(project_key)
+    relay.send_event(project_key)
+    relay.send_event(project_key)
+    # Wait for caches to expire. And we will get into the grace period.
+    time.sleep(3)
+    # The state should be fixed and updated by now, since we keep re-trying to fetch new one all the time.
+    data = get_response(relay, packed, signature)
+    assert data["configs"][public_key]["projectId"] == project_key
+    assert not data["configs"][public_key]["disabled"]
+    time.sleep(1)
+
+    # We should have the previous events through now.
+    event = mini_sentry.captured_events.get(timeout=1).get_event()
+    assert event["logentry"] == {"formatted": "Hello, World!"}
+
+    # This must succeed, since we will re-request the project state update at this point.
+    relay.send_event(project_key)
+    event = mini_sentry.captured_events.get(timeout=1).get_event()
+    assert event["logentry"] == {"formatted": "Hello, World!"}
+
+
+def test_cached_project_config(mini_sentry, relay):
+    project_key = 42
+    relay_config = {
+        "cache": {"project_expiry": 2, "project_grace_period": 5, "miss_expiry": 2}
+    }
+    relay = relay(mini_sentry, relay_config, wait_health_check=True)
+    mini_sentry.add_full_project_config(project_key)
+    public_key = mini_sentry.get_dsn_public_key(project_key)
+
+    # Once the event is sent the project state is requested and cached.
+    relay.send_event(project_key)
+    event = mini_sentry.captured_events.get(timeout=1).get_event()
+    assert event["logentry"] == {"formatted": "Hello, World!"}
+    # send a second event
+    relay.send_event(project_key)
+    event = mini_sentry.captured_events.get(timeout=1).get_event()
+    assert event["logentry"] == {"formatted": "Hello, World!"}
+
+    body = {"publicKeys": [public_key]}
+    packed, signature = SecretKey.parse(relay.secret_key).pack(body)
+    data = get_response(relay, packed, signature)
+    assert data["configs"][public_key]["projectId"] == project_key
+    assert not data["configs"][public_key]["disabled"]
+
+    # Introduce unparsable config.
+    config = mini_sentry.project_configs[project_key]["config"]
+    ds = config.setdefault("dynamicSampling", {})
+    ds.setdefault("rules", [])
+    ds.setdefault("rulesV2", []).append(
+        {
+            "condition": {
+                "op": "and",
+                "inner": [
+                    {"op": "glob", "name": "releases", "value": ["1.1.1", "1.1.2"]}
+                ],
+            },
+            "samplingValue": {"type": "sampleRate", "value": 0.7},
+            "type": "trace",
+            "id": 1,
+            "timeRange": {
+                "start": "2022-10-10T00:00:00.000000Z",
+                "end": "2022-10-20T00:00:00.000000Z",
+            },
+            "decayingFn": {"function": "linear", "decayedSampleRate": 0.9},
+        }
+    )
+
+    # Give it a bit time for update to go through.
+    time.sleep(1)
+    data = get_response(relay, packed, signature)
+
+    assert data["configs"][public_key]["projectId"] == project_key
+    assert not data["configs"][public_key]["disabled"]
+
+    # Wait till grace period expires as well and we should start buffering the events now.
+    time.sleep(5)
+    try:
+        relay.send_event(project_key)
+        time.sleep(0.5)
+        assert {str(e) for _, e in mini_sentry.test_failures} == {
+            f"Relay sent us event: error fetching project state {public_key}: missing field `type`",
+        }
+    finally:
+        mini_sentry.test_failures.clear()

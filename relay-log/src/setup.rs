@@ -1,14 +1,17 @@
+use std::borrow::Cow;
 use std::env;
-use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
-use log::{Level, LevelFilter};
 use sentry::types::Dsn;
 use serde::{Deserialize, Serialize};
+use tracing::{level_filters::LevelFilter, Level};
+use tracing_subscriber::{prelude::*, EnvFilter, Layer};
 
-use crate::sentry_failure::FailureIntegration;
+/// The full release name including the Relay version and SHA.
+const RELEASE: &str = std::env!("RELAY_RELEASE");
+
+// Import CRATE_NAMES, which lists all crates in the workspace.
+include!(concat!(env!("OUT_DIR"), "/constants.gen.rs"));
 
 /// Controls the log format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
@@ -41,12 +44,54 @@ pub enum LogFormat {
     Json,
 }
 
+mod level_serde {
+    use std::fmt;
+
+    use serde::de::{Error, Unexpected, Visitor};
+    use serde::{Deserializer, Serializer};
+    use tracing::Level;
+
+    pub fn serialize<S>(filter: &Level, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(filter)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Level, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V;
+
+        impl<'de> Visitor<'de> for V {
+            type Value = Level;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a log level")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Level, E>
+            where
+                E: Error,
+            {
+                value
+                    .parse()
+                    .map_err(|_| Error::invalid_value(Unexpected::Str(value), &self))
+            }
+        }
+
+        deserializer.deserialize_str(V)
+    }
+}
+
 /// Controls the logging system.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LogConfig {
     /// The log level for Relay.
-    pub level: log::LevelFilter,
+    #[serde(with = "level_serde")]
+    pub level: Level,
 
     /// Controls the log output format.
     ///
@@ -62,7 +107,7 @@ pub struct LogConfig {
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
-            level: log::LevelFilter::Info,
+            level: Level::INFO,
             format: LogFormat::Auto,
             enable_backtraces: false,
         }
@@ -78,6 +123,9 @@ pub struct SentryConfig {
 
     /// Enables reporting to Sentry.
     pub enabled: bool,
+
+    /// Sets the environment for this service.
+    pub environment: Option<Cow<'static, str>>,
 
     /// Internal. Enables crash handling and sets the absolute path to where minidumps should be
     /// cached on disk. The path is created if it doesn't exist. Path must be UTF-8.
@@ -98,9 +146,42 @@ impl Default for SentryConfig {
                 .parse()
                 .ok(),
             enabled: false,
+            environment: None,
             _crash_db: None,
         }
     }
+}
+
+/// Captures an envelope from the native crash reporter using the main Sentry SDK.
+#[cfg(feature = "relay-crash")]
+fn capture_native_envelope(data: &[u8]) {
+    if let Some(client) = sentry::Hub::main().client() {
+        match sentry::Envelope::from_slice(data) {
+            Ok(envelope) => client.send_envelope(envelope),
+            Err(error) => crate::error!("failed to capture crash: {}", crate::LogError(&error)),
+        }
+    } else {
+        crate::error!("failed to capture crash: no sentry client registered");
+    }
+}
+
+/// Configures the given log level for all of Relay's crates.
+fn get_default_filters() -> EnvFilter {
+    // Configure INFO as default, except for crates that are very spammy on INFO level.
+    let mut env_filter = EnvFilter::new(
+        "INFO,\
+        sqlx=WARN,\
+        tower_http=TRACE,\
+        trust_dns_proto=WARN,\
+        ",
+    );
+
+    // Add all internal modules with maximum log-level.
+    for name in CRATE_NAMES {
+        env_filter = env_filter.add_directive(format!("{name}=TRACE").parse().unwrap());
+    }
+
+    env_filter
 }
 
 /// Initialize the logging system and reporting to Sentry.
@@ -122,146 +203,61 @@ pub fn init(config: &LogConfig, sentry: &SentryConfig) {
         env::set_var("RUST_BACKTRACE", "full");
     }
 
-    if env::var("RUST_LOG").is_err() {
-        let log = match config.level {
-            LevelFilter::Off => "",
-            LevelFilter::Error => "ERROR",
-            LevelFilter::Warn => "WARN",
-            LevelFilter::Info => {
-                "INFO,\
-                 trust_dns_proto=WARN"
-            }
-            LevelFilter::Debug => {
-                "INFO,\
-                 trust_dns_proto=WARN,\
-                 actix_web::pipeline=DEBUG,\
-                 relay_auth=DEBUG,\
-                 relay_common=DEBUG,\
-                 relay_config=DEBUG,\
-                 relay_filter=DEBUG,\
-                 relay_general=DEBUG,\
-                 relay_quotas=DEBUG,\
-                 relay_redis=DEBUG,\
-                 relay_server=DEBUG,\
-                 relay=DEBUG"
-            }
-            LevelFilter::Trace => {
-                "INFO,\
-                 trust_dns_proto=WARN,\
-                 actix_web::pipeline=DEBUG,\
-                 relay_auth=TRACE,\
-                 relay_common=TRACE,\
-                 relay_config=TRACE,\
-                 relay_filter=TRACE,\
-                 relay_general=TRACE,\
-                 relay_quotas=TRACE,\
-                 relay_redis=TRACE,\
-                 relay_server=TRACE,\
-                 relay=TRACE"
-            }
-        }
-        .to_string();
+    let subscriber = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(true);
 
-        env::set_var("RUST_LOG", log);
+    let format = match (config.format, console::user_attended()) {
+        (LogFormat::Auto, true) | (LogFormat::Pretty, _) => {
+            subscriber.compact().without_time().boxed()
+        }
+        (LogFormat::Auto, false) | (LogFormat::Simplified, _) => {
+            subscriber.with_ansi(false).boxed()
+        }
+        (LogFormat::Json, _) => subscriber
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_file(true)
+            .with_line_number(true)
+            .boxed(),
+    };
+
+    tracing_subscriber::registry()
+        .with(format.with_filter(LevelFilter::from(config.level)))
+        .with(sentry::integrations::tracing::layer())
+        .with(match env::var(EnvFilter::DEFAULT_ENV) {
+            Ok(value) => EnvFilter::new(value),
+            Err(_) => get_default_filters(),
+        })
+        .init();
+
+    if let Some(dsn) = sentry.enabled_dsn() {
+        let guard = sentry::init(sentry::ClientOptions {
+            dsn: Some(dsn).cloned(),
+            in_app_include: vec!["relay"],
+            release: Some(RELEASE.into()),
+            attach_stacktrace: config.enable_backtraces,
+            environment: sentry.environment.clone(),
+            ..Default::default()
+        });
+
+        // Keep the client initialized. The client is flushed manually in `main`.
+        std::mem::forget(guard);
     }
 
-    let mut log_builder = {
-        match (config.format, console::user_attended()) {
-            (LogFormat::Auto, true) | (LogFormat::Pretty, _) => {
-                pretty_env_logger::formatted_builder()
-            }
-            (LogFormat::Auto, false) | (LogFormat::Simplified, _) => {
-                let mut builder = env_logger::Builder::new();
-                builder.format(|buf, record| {
-                    let ts = buf.timestamp();
-                    writeln!(
-                        buf,
-                        "{} [{}] {}: {}",
-                        ts,
-                        record.module_path().unwrap_or("<unknown>"),
-                        record.level(),
-                        record.args()
-                    )
-                });
-                builder
-            }
-            (LogFormat::Json, _) => {
-                #[derive(Serialize, Deserialize, Debug)]
-                struct LogRecord<'a> {
-                    timestamp: DateTime<Utc>,
-                    level: Level,
-                    logger: &'a str,
-                    message: String,
-                    module_path: Option<&'a str>,
-                    filename: Option<&'a str>,
-                    lineno: Option<u32>,
-                }
-
-                let mut builder = env_logger::Builder::new();
-                builder.format(|mut buf, record| -> io::Result<()> {
-                    serde_json::to_writer(
-                        &mut buf,
-                        &LogRecord {
-                            timestamp: Utc::now(),
-                            level: record.level(),
-                            logger: record.target(),
-                            message: record.args().to_string(),
-                            module_path: record.module_path(),
-                            filename: record.file(),
-                            lineno: record.line(),
-                        },
-                    )
-                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-                    buf.write_all(b"\n")?;
-                    Ok(())
-                });
-                builder
-            }
-        }
-    };
-
-    match env::var("RUST_LOG") {
-        Ok(rust_log) => log_builder.parse_filters(&rust_log),
-        Err(_) => log_builder.filter_level(config.level),
-    };
-
-    let dest_log = log_builder.build();
-    log::set_max_level(dest_log.filter());
-
-    let log = sentry::integrations::log::SentryLogger::with_dest(dest_log);
-    log::set_boxed_logger(Box::new(log)).ok();
-
-    let release = sentry::release_name!();
+    // Initialize native crash reporting after the Rust SDK, so that `capture_native_envelope` has
+    // access to an initialized Hub to capture crashes from the previous run.
     #[cfg(feature = "relay-crash")]
     {
         if let Some(dsn) = sentry.enabled_dsn().map(|d| d.to_string()) {
             if let Some(db) = sentry._crash_db.as_deref() {
-                relay_crash::CrashHandler::new(dsn.as_ref(), db)
-                    .release(release.as_deref())
+                relay_crash::CrashHandler::new(dsn.as_str(), db)
+                    .transport(capture_native_envelope)
+                    .release(Some(RELEASE))
                     .install();
             }
         }
     }
-
-    let guard = sentry::init(sentry::ClientOptions {
-        dsn: sentry.enabled_dsn().cloned(),
-        in_app_include: vec![
-            "relay_auth::",
-            "relay_common::",
-            "relay_config::",
-            "relay_filter::",
-            "relay_general::",
-            "relay_quotas::",
-            "relay_redis::",
-            "relay_server::",
-            "relay::",
-        ],
-        integrations: vec![Arc::new(FailureIntegration::new())],
-        release,
-        attach_stacktrace: config.enable_backtraces,
-        ..Default::default()
-    });
-
-    // Keep the client initialized. The client is flushed manually in `main`.
-    std::mem::forget(guard);
 }

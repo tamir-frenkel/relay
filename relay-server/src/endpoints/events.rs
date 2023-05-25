@@ -1,36 +1,30 @@
 //! Returns captured events.
 
-use actix_web::actix::*;
-use actix_web::{http::Method, HttpResponse, Path};
-use futures::future::Future;
-
-use crate::actors::envelopes::{EnvelopeManager, GetCapturedEnvelope};
-use crate::envelope;
-use crate::service::ServiceApp;
-
+use axum::extract::Path;
+use axum::http::{header, StatusCode};
+use axum::response::IntoResponse;
 use relay_general::protocol::EventId;
 
-fn get_captured_event(event_id: Path<EventId>) -> ResponseFuture<HttpResponse, MailboxError> {
-    let future = EnvelopeManager::from_registry()
-        .send(GetCapturedEnvelope {
-            event_id: *event_id,
-        })
-        .map(|captured_event| match captured_event {
-            Some(Ok(envelope)) => HttpResponse::Ok()
-                .content_type(envelope::CONTENT_TYPE)
-                .body(envelope.to_vec().unwrap()),
-            Some(Err(error)) => HttpResponse::BadRequest()
-                .content_type("text/plain")
-                .body(error),
-            None => HttpResponse::NotFound().finish(),
-        });
+use crate::actors::test_store::GetCapturedEnvelope;
+use crate::endpoints::common::ServiceUnavailable;
+use crate::envelope;
+use crate::service::ServiceState;
 
-    Box::new(future)
-}
+pub async fn handle(
+    state: ServiceState,
+    Path(event_id): Path<EventId>,
+) -> Result<impl IntoResponse, ServiceUnavailable> {
+    let envelope_opt = state
+        .test_store()
+        .send(GetCapturedEnvelope { event_id })
+        .await?;
 
-pub fn configure_app(app: ServiceApp) -> ServiceApp {
-    app.resource("/api/relay/events/{event_id}/", |r| {
-        r.name("internal-events");
-        r.method(Method::GET).with(get_captured_event);
+    Ok(match envelope_opt {
+        Some(Ok(envelope)) => {
+            let headers = [(header::CONTENT_TYPE, envelope::CONTENT_TYPE)];
+            (StatusCode::OK, headers, envelope.to_vec().unwrap()).into_response()
+        }
+        Some(Err(error)) => (StatusCode::BAD_REQUEST, error).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     })
 }

@@ -1,30 +1,34 @@
-use relay_statsd::{CounterMetric, GaugeMetric, HistogramMetric, SetMetric, TimerMetric};
+use relay_statsd::{CounterMetric, GaugeMetric, HistogramMetric, TimerMetric};
 
 /// Gauge metrics used by Relay
 pub enum RelayGauges {
     /// The state of Relay with respect to the upstream connection.
     /// Possible values are `0` for normal operations and `1` for a network outage.
     NetworkOutage,
+    /// The number of items currently in the garbage disposal queue.
+    ProjectCacheGarbageQueueSize,
+    /// The number of envelopes waiting for project states in memory.
+    ///
+    /// This number is always <= `EnvelopeQueueSize`.
+    ///
+    /// The memory buffer size can be configured with `spool.envelopes.max_memory_size`.
+    BufferEnvelopesMemoryCount,
+    /// The number of envelopes waiting for project states on disk.
+    ///
+    /// Note this metric *will not be logged* when we encounter envelopes in the database on startup,
+    /// because counting those envelopes reliably would risk locking the db for multiple seconds.
+    ///
+    /// The disk buffer size can be configured with `spool.envelopes.max_disk_size`.
+    BufferEnvelopesDiskCount,
 }
 
 impl GaugeMetric for RelayGauges {
     fn name(&self) -> &'static str {
         match self {
             RelayGauges::NetworkOutage => "upstream.network_outage",
-        }
-    }
-}
-
-/// Set metrics used by Relay
-pub enum RelaySets {
-    /// Represents the number of active projects in the current slice of time
-    UniqueProjects,
-}
-
-impl SetMetric for RelaySets {
-    fn name(&self) -> &'static str {
-        match self {
-            RelaySets::UniqueProjects => "unique_projects",
+            RelayGauges::ProjectCacheGarbageQueueSize => "project_cache.garbage.queue_size",
+            RelayGauges::BufferEnvelopesMemoryCount => "buffer.envelopes_mem_count",
+            RelayGauges::BufferEnvelopesDiskCount => "buffer.envelopes_disk_count",
         }
     }
 }
@@ -52,25 +56,26 @@ pub enum RelayHistograms {
     ///
     /// The queue size can be configured with `cache.event_buffer_size`.
     EnvelopeQueueSize,
-    /// The size of the HTTP request body as seen by Relay after it is extracted from a request in
-    /// bytes.
+    /// The estimated number of envelope bytes buffered in memory.
     ///
-    /// - For envelope requests, this is the full size of the envelope.
-    /// - For JSON store requests, this is the size of the JSON body.
-    /// - For multipart uploads of crash reports and attachments, this is the size of the multipart
-    ///   body including boundaries.
+    /// The memory buffer size can be configured with `spool.envelopes.max_memory_size`.
+    BufferEnvelopesMemoryBytes,
+    /// The file size of the buffer db on disk, in bytes.
     ///
-    /// If this request contains a base64 zlib compressed payload without a proper
-    /// `content-encoding` header, then this is the size before decompression.
+    /// This metric is computed by multiplying `page_count * page_size`.
+    BufferDiskSize,
+    /// Number of attempts needed to dequeue spooled envelopes from disk.
     ///
-    /// The maximum request body size can be configured with `limits.max_envelope_size`.
-    RequestSizeBytesRaw,
-    /// The size of the request body as seen by Relay after decompression and decoding in bytes.
+    /// As long as there are enough permits in the [`crate::utils::BufferGuard`], this number should
+    /// always be one.
+    BufferDequeueAttempts,
+    /// The number of spans per processed transaction event.
     ///
-    /// JSON store requests may contain a base64 zlib compressed payload without proper
-    /// `content-encoding` header. In this case, this metric contains the size after decoding.
-    /// Otherwise, it is always equal to `event.size_bytes.raw`.
-    RequestSizeBytesUncompressed,
+    /// This metric is tagged with:
+    ///  - `platform`: The event's platform, such as `"javascript"`.
+    ///  - `sdk`: The name of the Sentry SDK sending the transaction. This tag is only set for
+    ///    Sentry's SDKs and defaults to "proprietary".
+    EventSpans,
     /// Number of projects in the in-memory project cache that are waiting for their state to be
     /// updated.
     ///
@@ -89,6 +94,8 @@ pub enum RelayHistograms {
     ///
     /// See `project_cache.size` for more description of the project cache.
     ProjectStateReceived,
+    /// Number of attempts required to fetch the config for a given project key.
+    ProjectStateAttempts,
     /// Number of project states currently held in the in-memory project cache.
     ///
     /// The cache duration for project states can be configured with the following options:
@@ -101,6 +108,12 @@ pub enum RelayHistograms {
     ///
     /// There is no limit to the number of cached projects.
     ProjectStateCacheSize,
+    /// The size of the compressed project config in the redis cache, in bytes.
+    #[cfg(feature = "processing")]
+    ProjectStateSizeBytesCompressed,
+    /// The size of the uncompressed project config in the redis cache, in bytes.
+    #[cfg(feature = "processing")]
+    ProjectStateSizeBytesDecompressed,
     /// The number of upstream requests queued up for sending.
     ///
     /// Relay employs connection keep-alive whenever possible. Connections are kept open for _15_
@@ -130,10 +143,6 @@ pub enum RelayHistograms {
     ///   - `status-code`: The status code of the request when available, otherwise "-".
     UpstreamRetries,
 
-    /// Size of emitted kafka message in bytes, tagged by message type.
-    #[cfg(feature = "processing")]
-    KafkaMessageSize,
-
     /// Size of envelopes sent over HTTP in bytes.
     UpstreamQueryBodySize,
 
@@ -147,16 +156,25 @@ impl HistogramMetric for RelayHistograms {
         match self {
             RelayHistograms::EnvelopeQueueSizePct => "event.queue_size.pct",
             RelayHistograms::EnvelopeQueueSize => "event.queue_size",
-            RelayHistograms::RequestSizeBytesRaw => "event.size_bytes.raw",
-            RelayHistograms::RequestSizeBytesUncompressed => "event.size_bytes.uncompressed",
+            RelayHistograms::EventSpans => "event.spans",
+            RelayHistograms::BufferEnvelopesMemoryBytes => "buffer.envelopes_mem",
+            RelayHistograms::BufferDiskSize => "buffer.disk_size",
+            RelayHistograms::BufferDequeueAttempts => "buffer.dequeue_attempts",
             RelayHistograms::ProjectStatePending => "project_state.pending",
+            RelayHistograms::ProjectStateAttempts => "project_state.attempts",
             RelayHistograms::ProjectStateRequestBatchSize => "project_state.request.batch_size",
             RelayHistograms::ProjectStateReceived => "project_state.received",
             RelayHistograms::ProjectStateCacheSize => "project_cache.size",
+            #[cfg(feature = "processing")]
+            RelayHistograms::ProjectStateSizeBytesCompressed => {
+                "project_state.size_bytes.compressed"
+            }
+            #[cfg(feature = "processing")]
+            RelayHistograms::ProjectStateSizeBytesDecompressed => {
+                "project_state.size_bytes.decompressed"
+            }
             RelayHistograms::UpstreamMessageQueueSize => "http_queue.size",
             RelayHistograms::UpstreamRetries => "upstream.retries",
-            #[cfg(feature = "processing")]
-            RelayHistograms::KafkaMessageSize => "kafka.message_size",
             RelayHistograms::UpstreamQueryBodySize => "upstream.query.body_size",
             RelayHistograms::UpstreamEnvelopeBodySize => "upstream.envelope.body_size",
         }
@@ -168,12 +186,14 @@ pub enum RelayTimers {
     /// Time in milliseconds spent deserializing an event from JSON bytes into the native data
     /// structure on which Relay operates.
     EventProcessingDeserialize,
+    /// Time in milliseconds spent running light normalization on an event. Light normalization
+    /// happens before envelope filtering and metrics extraction.
+    EventProcessingLightNormalization,
     /// Time in milliseconds spent running event processors on an event for normalization. Event
     /// processing happens before filtering.
     #[cfg(feature = "processing")]
     EventProcessingProcess,
     /// Time in milliseconds spent running inbound data filters on an event.
-    #[cfg(feature = "processing")]
     EventProcessingFiltering,
     /// Time in milliseconds spent checking for organization, project, and DSN rate limits.
     ///
@@ -187,9 +207,11 @@ pub enum RelayTimers {
     EventProcessingPii,
     /// Time spent converting the event from its in-memory reprsentation into a JSON string.
     EventProcessingSerialization,
-    /// Time spent between receiving a request in Relay (that is, beginning of request handling) and
-    /// the start of synchronous processing in the EnvelopeProcessor. This metric primarily
-    /// indicates backlog in event processing.
+    /// Time spent between the start of request handling and processing of the envelope.
+    ///
+    /// This includes streaming the request body, scheduling overheads, project config fetching,
+    /// batched requests and congestions in the internal processor. This does not include delays in
+    /// the incoming request (body upload) and skips all envelopes that are fast-rejected.
     EnvelopeWaitTime,
     /// Time in milliseconds spent in synchronous processing of envelopes.
     ///
@@ -220,6 +242,12 @@ pub enum RelayTimers {
     /// Note that after an update loop has completed, there may be more projects pending updates.
     /// This is indicated by `project_state.pending`.
     ProjectStateRequestDuration,
+    /// Time in milliseconds required to decompress a project config from redis.
+    ///
+    /// Note that this also times the cases where project config is uncompressed,
+    /// in which case the timer should be very close to zero.
+    #[cfg(feature = "processing")]
+    ProjectStateDecompression,
     /// Total duration in milliseconds for handling inbound web requests until the HTTP response is
     /// returned to the client.
     ///
@@ -286,17 +314,21 @@ pub enum RelayTimers {
     OutcomeAggregatorFlushTime,
 
     /// Time in milliseconds spent on converting a transaction event into a metric.
-    #[cfg(feature = "processing")]
     TransactionMetricsExtraction,
+
+    /// Time in milliseconds spent on parsing, normalizing and scrubbing replay recordings.
+    ReplayRecordingProcessing,
 }
 
 impl TimerMetric for RelayTimers {
     fn name(&self) -> &'static str {
         match self {
             RelayTimers::EventProcessingDeserialize => "event_processing.deserialize",
+            RelayTimers::EventProcessingLightNormalization => {
+                "event_processing.light_normalization"
+            }
             #[cfg(feature = "processing")]
             RelayTimers::EventProcessingProcess => "event_processing.process",
-            #[cfg(feature = "processing")]
             RelayTimers::EventProcessingFiltering => "event_processing.filtering",
             #[cfg(feature = "processing")]
             RelayTimers::EventProcessingRateLimiting => "event_processing.rate_limiting",
@@ -307,14 +339,16 @@ impl TimerMetric for RelayTimers {
             RelayTimers::EnvelopeTotalTime => "event.total_time",
             RelayTimers::ProjectStateEvictionDuration => "project_state.eviction.duration",
             RelayTimers::ProjectStateRequestDuration => "project_state.request.duration",
+            #[cfg(feature = "processing")]
+            RelayTimers::ProjectStateDecompression => "project_state.decompression",
             RelayTimers::RequestsDuration => "requests.duration",
             RelayTimers::MinidumpScrubbing => "scrubbing.minidumps.duration",
             RelayTimers::AttachmentScrubbing => "scrubbing.attachments.duration",
             RelayTimers::UpstreamRequestsDuration => "upstream.requests.duration",
             RelayTimers::TimestampDelay => "requests.timestamp_delay",
             RelayTimers::OutcomeAggregatorFlushTime => "outcomes.aggregator.flush_time",
-            #[cfg(feature = "processing")]
             RelayTimers::TransactionMetricsExtraction => "metrics.extraction.transactions",
+            RelayTimers::ReplayRecordingProcessing => "replay.recording.process",
         }
     }
 }
@@ -331,6 +365,10 @@ pub enum RelayCounters {
     ///
     /// This represents requests that have successfully passed rate limits and filters, and have
     /// been sent to the upstream.
+    ///
+    /// This metric is tagged with:
+    ///  - `handling`: Either `"success"` if the envelope was handled correctly, or `"failure"` if
+    ///    there was an error or bug.
     EnvelopeAccepted,
     /// Number of envelopes rejected in the current time slot.
     ///
@@ -338,7 +376,20 @@ pub enum RelayCounters {
     /// processing (including filtered events, invalid payloads, and rate limits).
     ///
     /// To check the rejection reason, check `events.outcomes`, instead.
+    ///
+    /// This metric is tagged with:
+    ///  - `handling`: Either `"success"` if the envelope was handled correctly, or `"failure"` if
+    ///    there was an error or bug.
     EnvelopeRejected,
+    /// Number times the envelope buffer spools to disk.
+    BufferWrites,
+    /// Number times the envelope buffer reads back from disk.
+    BufferReads,
+    /// Number of _envelopes_ the envelope buffer spools to disk.
+    BufferEnvelopesWritten,
+    /// Number of _envelopes_ the envelope buffer reads back from disk.
+    BufferEnvelopesRead,
+    ///
     /// Number of outcomes and reasons for rejected Envelopes.
     ///
     /// This metric is tagged with:
@@ -383,6 +434,12 @@ pub enum RelayCounters {
     /// A maximum of 1 such requests per second is allowed per project key. This metric counts only
     /// permitted requests.
     ProjectStateNoCache,
+    /// Number of times a project state is requested from the central Redis cache.
+    ///
+    /// This has a tag `hit` with values `true` or `false`.  If false the request will be
+    /// sent to the sentry endpoint.
+    #[cfg(feature = "processing")]
+    ProjectStateRedis,
     /// Number of times a project is looked up from the cache.
     ///
     /// The cache may contain and outdated or expired project state. In that case, the project state
@@ -392,6 +449,13 @@ pub enum RelayCounters {
     ///
     /// A cache entry is created immediately and the project state requested from the upstream.
     ProjectCacheMiss,
+    /// Number of times an upstream request for a project config is completed.
+    ///
+    /// Completion can be because a result was returned or because the config request was
+    /// dropped after there still was no response after a timeout.  This metrics has tags
+    /// for `result` and `attempts` indicating whether it was succesful or a timeout and how
+    /// many attempts were made respectively.
+    ProjectUpstreamCompleted,
     /// Number of Relay server starts.
     ///
     /// This can be used to track unwanted restarts due to crashes or termination.
@@ -415,14 +479,6 @@ pub enum RelayCounters {
     ///  - `session`: A release health session update, sent to `ingest-sessions`.
     #[cfg(feature = "processing")]
     ProcessingMessageProduced,
-    /// Number of producer errors occurred after an envelope was already enqueued for sending to
-    /// Kafka.
-    ///
-    /// These errors include, for example, _"MessageTooLarge"_ errors when the broker does not
-    /// accept the requests over a certain size, which is usually due to invalid or inconsistent
-    /// broker/producer configurations.
-    #[cfg(feature = "processing")]
-    ProcessingProduceError,
     /// Number of events that hit any of the store-like endpoints: Envelope, Store, Security,
     /// Minidump, Unreal.
     ///
@@ -431,6 +487,26 @@ pub enum RelayCounters {
     /// This metric is tagged with:
     ///  - `version`: The event protocol version number defaulting to `7`.
     EventProtocol,
+    /// The number of transaction events processed by the source of the transaction name.
+    ///
+    /// This metric is tagged with:
+    ///  - `platform`: The event's platform, such as `"javascript"`.
+    ///  - `sdk`: The name of the Sentry SDK sending the transaction. This tag is only set for
+    ///    Sentry's SDKs and defaults to "proprietary".
+    ///  - `source`: The source of the transaction name on the client. See the [transaction source
+    ///    documentation](https://develop.sentry.dev/sdk/event-payloads/properties/transaction_info/)
+    ///    for all valid values.
+    EventTransactionSource,
+    /// The number of transaction events processed grouped by transaction name modifications.
+    /// This metric is tagged with:
+    ///  - `source_in`: The source of the transaction name before normalization.
+    ///    See the [transaction source
+    ///    documentation](https://develop.sentry.dev/sdk/event-payloads/properties/transaction_info/)
+    ///    for all valid values.
+    ///  - `change`: The mechanism that changed the transaction name.
+    ///    Either `"none"`, `"pattern"`, `"rule"`, or `"both"`.
+    ///  - `source_out`: The source of the transaction name after normalization.
+    TransactionNameChanges,
     /// Number of HTTP requests reaching Relay.
     Requests,
     /// Number of completed HTTP requests.
@@ -456,6 +532,15 @@ pub enum RelayCounters {
     EvictingStaleProjectCaches,
     /// Number of times that parsing a metrics bucket item from an envelope failed.
     MetricBucketsParsingFailed,
+    /// Count extraction of transaction names. Tag with the decision to drop / replace / use original.
+    MetricsTransactionNameExtracted,
+    /// Number of Events with an OpenTelemetry Context
+    ///
+    /// This metric is tagged with:
+    ///  - `platform`: The event's platform, such as `"javascript"`.
+    ///  - `sdk`: The name of the Sentry SDK sending the transaction. This tag is only set for
+    ///    Sentry's SDKs and defaults to "proprietary".
+    OpenTelemetryEvent,
 }
 
 impl CounterMetric for RelayCounters {
@@ -465,22 +550,31 @@ impl CounterMetric for RelayCounters {
             RelayCounters::EventCorrupted => "event.corrupted",
             RelayCounters::EnvelopeAccepted => "event.accepted",
             RelayCounters::EnvelopeRejected => "event.rejected",
+            RelayCounters::BufferWrites => "buffer.writes",
+            RelayCounters::BufferReads => "buffer.reads",
+            RelayCounters::BufferEnvelopesWritten => "buffer.envelopes_written",
+            RelayCounters::BufferEnvelopesRead => "buffer.envelopes_read",
             RelayCounters::Outcomes => "events.outcomes",
             RelayCounters::ProjectStateGet => "project_state.get",
             RelayCounters::ProjectStateRequest => "project_state.request",
             RelayCounters::ProjectStateNoCache => "project_state.no_cache",
+            #[cfg(feature = "processing")]
+            RelayCounters::ProjectStateRedis => "project_state.redis.requests",
+            RelayCounters::ProjectUpstreamCompleted => "project_upstream.completed",
             RelayCounters::ProjectCacheHit => "project_cache.hit",
             RelayCounters::ProjectCacheMiss => "project_cache.miss",
             RelayCounters::ServerStarting => "server.starting",
             #[cfg(feature = "processing")]
             RelayCounters::ProcessingMessageProduced => "processing.event.produced",
-            #[cfg(feature = "processing")]
-            RelayCounters::ProcessingProduceError => "processing.produce.error",
             RelayCounters::EventProtocol => "event.protocol",
+            RelayCounters::EventTransactionSource => "event.transaction_source",
+            RelayCounters::TransactionNameChanges => "event.transaction_name_changes",
             RelayCounters::Requests => "requests",
             RelayCounters::ResponsesStatusCodes => "responses.status_codes",
             RelayCounters::EvictingStaleProjectCaches => "project_cache.eviction",
             RelayCounters::MetricBucketsParsingFailed => "metrics.buckets.parsing_failed",
+            RelayCounters::MetricsTransactionNameExtracted => "metrics.transaction_name",
+            RelayCounters::OpenTelemetryEvent => "event.opentelemetry",
         }
     }
 }

@@ -8,40 +8,35 @@ on:
   # Run actions on PRs, but only deploy on master
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   cargo_docs:
     name: Cargo Docs
     runs-on: ubuntu-latest
 
-    env:
-      RUSTDOCFLAGS: -Dbroken_intra_doc_links
-
     steps:
       - name: Install libcurl-dev
         run: |
-          sudo apt update
+          sudo apt-get update
           sudo apt-get install -y libcurl4-openssl-dev
 
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           submodules: recursive
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          components: rust-docs
-          override: true
+      - name: Install Rust Toolchain
+        run: rustup toolchain install stable --profile minimal --component rust-docs --no-self-update
 
-      - uses: swatinem/rust-cache@v1
+      - uses: swatinem/rust-cache@v2
         with:
           key: ${{ github.job }}
 
       - name: Build Docs
-        uses: actions-rs/cargo@v1
-        with:
-          command: doc
-          args: --workspace --all-features --no-deps
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -Dwarnings
 
       - run: echo '<meta http-equiv="refresh" content="0; url=relay/" />Redirecting to <a href="relay/">relay</a>' > target/doc/index.html
 
@@ -57,25 +52,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           submodules: recursive
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+      - name: Install Rust Toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
 
-      - uses: swatinem/rust-cache@v1
+      - uses: swatinem/rust-cache@v2
         with:
           key: ${{ github.job }}
 
       - name: Generate Schema
-        uses: actions-rs/cargo@v1
-        with:
-          command: run
-          args: -p generate-schema -- -o event.schema.json
+        run: cargo run -p generate-schema -- -o event.schema.json
 
       - name: Deploy
         if: github.ref == 'refs/heads/master'
@@ -113,23 +102,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+      - name: Install Rust Toolchain
+        run: rustup toolchain install stable --profile minimal --no-self-update
 
-      - uses: swatinem/rust-cache@v1
+      - uses: swatinem/rust-cache@v2
         with:
           key: ${{ github.job }}
 
       - name: Document Metrics
-        uses: actions-rs/cargo@v1
-        with:
-          command: run
-          args: -p document-metrics -- -o relay_metrics.json relay-server/src/statsd.rs relay-metrics/src/statsd.rs
+        run: cargo run -p document-metrics -- -o relay_metrics.json
+          relay-kafka/src/statsd.rs
+          relay-metrics/src/statsd.rs
+          relay-server/src/statsd.rs
+          relay-system/src/statsd.rs
 
       - name: Deploy
         if: github.ref == 'refs/heads/master'

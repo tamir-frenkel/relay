@@ -1,7 +1,7 @@
 #![allow(clippy::needless_update)]
 use std::collections::BTreeMap;
 
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 
 use crate::pii::{
     AliasRule, MultipleRule, PatternRule, Redaction, ReplaceRedaction, RuleSpec, RuleType,
@@ -9,20 +9,13 @@ use crate::pii::{
 
 macro_rules! declare_builtin_rules {
     ($($rule_id:expr => $spec:expr;)*) => {
-        lazy_static! {
-            pub(crate) static ref BUILTIN_RULES_MAP: BTreeMap<&'static str, &'static RuleSpec> = {
-                let mut map = BTreeMap::new();
-                $(
-                    map.insert($rule_id, Box::leak(Box::new($spec)) as &'static _);
-                )*
-                map
-            };
-        }
-
-        /// Names of all builtin rules
-        pub static BUILTIN_RULES: &[&'static str] = &[
-            $($rule_id,)*
-        ];
+        pub(crate) static BUILTIN_RULES_MAP: Lazy<BTreeMap<&str, RuleSpec>> = Lazy::new(|| {
+            let mut map = BTreeMap::new();
+            $(
+                map.insert($rule_id, $spec);
+            )*
+            map
+        });
     }
 }
 
@@ -43,6 +36,7 @@ declare_builtin_rules! {
     "@common" => RuleSpec {
         ty: RuleType::Multiple(MultipleRule {
             rules: vec![
+                "@iban".into(),
                 "@ip".into(),
                 "@email".into(),
                 "@creditcard".into(),
@@ -61,6 +55,7 @@ declare_builtin_rules! {
         ty: RuleType::Multiple(MultipleRule {
             rules: vec![
                 "@creditcard:filter".into(),
+                "@iban:filter".into(),
                 "@pemkey:filter".into(),
                 "@urlauth:legacy".into(),
                 "@userpath:filter".into(),
@@ -89,6 +84,10 @@ declare_builtin_rules! {
     "@anything:mask" => RuleSpec {
         ty: RuleType::Anything,
         redaction: Redaction::Mask,
+    };
+    "@anything:filter" => RuleSpec {
+        ty: RuleType::Anything,
+        redaction: Redaction::Replace(ReplaceRedaction::default()),
     };
 
     // ip rules
@@ -194,6 +193,33 @@ declare_builtin_rules! {
     "@email:remove" => RuleSpec {
         ty: RuleType::Email,
         redaction: Redaction::Remove,
+    };
+
+    // iban rules
+    "@iban" => rule_alias!("@iban:replace");
+    "@iban:hash" => RuleSpec {
+        ty: RuleType::Iban,
+        redaction: Redaction::Hash,
+    };
+    "@iban:replace" => RuleSpec {
+        ty: RuleType::Iban,
+        redaction: Redaction::Replace(ReplaceRedaction {
+            text: "[iban]".into(),
+        }),
+    };
+    "@iban:mask" => RuleSpec {
+        ty: RuleType::Iban,
+        redaction: Redaction::Mask,
+    };
+    "@iban:filter" => RuleSpec {
+        ty: RuleType::Iban,
+        redaction: Redaction::Replace(ReplaceRedaction {
+            text: "[Filtered]".into(),
+        }),
+    };
+    "@iban:remove" => RuleSpec {
+        ty: RuleType::Iban,
+        redaction: Redaction::Remove
     };
 
     // creditcard rules
@@ -362,18 +388,42 @@ declare_builtin_rules! {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::pii::config::{PiiConfig, RuleSpec, RuleType};
+    use similar_asserts::assert_eq;
+
+    use super::*;
+    use crate::pii::config::PiiConfig;
     use crate::pii::processor::PiiProcessor;
-    use crate::pii::{Redaction, ReplaceRedaction};
     use crate::processor::{process_value, ProcessingState, ValueType};
     use crate::types::{Annotated, Remark, RemarkType};
-
-    use super::{BUILTIN_RULES, BUILTIN_RULES_MAP};
 
     #[derive(Clone, Debug, PartialEq, Empty, FromValue, ProcessValue, IntoValue)]
     struct FreeformRoot {
         #[metastructure(pii = "true")]
         value: Annotated<String>,
+    }
+
+    macro_rules! assert_rule_not_applied {
+        (
+            rule = $rule:expr; input = $input:expr;
+        ) => {{
+            let config = PiiConfig {
+                applications: {
+                    let mut map = BTreeMap::new();
+                    map.insert(ValueType::String.into(), vec![$rule.to_string()]);
+                    map
+                },
+                ..PiiConfig::default()
+            };
+            let input = $input.to_string();
+            let compiled = config.compiled();
+            let mut processor = PiiProcessor::new(&compiled);
+            let mut root = Annotated::new(FreeformRoot {
+                value: Annotated::new(input),
+            });
+            process_value(&mut root, &mut processor, ProcessingState::root()).unwrap();
+            let root = root.0.unwrap();
+            assert_eq!(root.value.value().unwrap(), $input);
+        }};
     }
 
     macro_rules! assert_text_rule {
@@ -396,9 +446,9 @@ mod tests {
             });
             process_value(&mut root, &mut processor, ProcessingState::root()).unwrap();
             let root = root.0.unwrap();
-            assert_eq_str!(root.value.value().unwrap(), $output);
+            assert_eq!(root.value.value().unwrap(), $output);
             let remarks: Vec<Remark> = $remarks;
-            assert_eq_dbg!(
+            assert_eq!(
                 root.value.meta().iter_remarks().collect::<Vec<_>>(),
                 remarks.iter().collect::<Vec<_>>()
             );
@@ -425,6 +475,7 @@ mod tests {
                                 "creditcard" => RuleType::Creditcard,
                                 "mac" => RuleType::Mac,
                                 "uuid" => RuleType::Uuid,
+                                "iban" => RuleType::Iban,
                                 "imei" => RuleType::Imei,
                                 _ => panic!("Unknown RuleType"),
                             },
@@ -455,9 +506,9 @@ mod tests {
             });
             process_value(&mut root, &mut processor, ProcessingState::root()).unwrap();
             let root = root.0.unwrap();
-            assert_eq_str!(root.value.value().unwrap(), $output);
+            assert_eq!(root.value.value().unwrap(), $output);
             let remarks: Vec<Remark> = $remarks;
-            assert_eq_dbg!(
+            assert_eq!(
                 root.value.meta().iter_remarks().collect::<Vec<_>>(),
                 remarks.iter().collect::<Vec<_>>()
             );
@@ -783,6 +834,237 @@ mod tests {
     }
 
     #[test]
+    fn test_iban_different_rules() {
+        assert_text_rule!(
+            rule = "@iban";
+            input = "some iban: DE89370400440532013000!";
+            output = "some iban: [iban]!";
+            remarks = vec![
+                Remark::with_range(RemarkType::Substituted, "@iban", (11, 17)),
+            ];
+        );
+        assert_text_rule!(
+            rule = "@iban";
+            input = "some iban: DE89370400440532013000!";
+            output = "some iban: [iban]!";
+            remarks = vec![
+                Remark::with_range(RemarkType::Substituted, "@iban", (11, 17)),
+            ];
+        );
+        assert_text_rule!(
+            rule = "@iban:mask";
+            input = "some iban: DE89370400440532013000!";
+            output = "some iban: **********************!";
+            remarks = vec![
+                Remark::with_range(RemarkType::Masked, "@iban:mask", (11, 33)),
+            ];
+        );
+        assert_custom_rulespec!(
+            rule = "@iban:mask";
+            input = "some iban: DE89370400440532013000!";
+            output = "some iban: **********************!";
+            remarks = vec![
+                Remark::with_range(RemarkType::Masked, "0", (11, 33)),
+            ];
+        );
+        assert_text_rule!(
+            rule = "@iban:replace";
+            input = "some iban: DE89370400440532013000!";
+            output = "some iban: [iban]!";
+            remarks = vec![
+                Remark::with_range(RemarkType::Substituted, "@iban:replace", (11, 17)),
+            ];
+        );
+        assert_custom_rulespec!(
+            rule = "@iban:replace";
+            input = "some iban: DE89370400440532013000!";
+            output = "some iban: [Filtered]!";
+            remarks = vec![
+                Remark::with_range(RemarkType::Substituted, "0", (11, 21)),
+            ];
+        );
+        assert_text_rule!(
+            rule = "@iban:hash";
+            input = "some iban: DE89370400440532013000!";
+            output = "some iban: 8A1248B6F40D38FBC59ADE6AD0DF69C7BB9C936A!";
+            remarks = vec![
+                Remark::with_range(RemarkType::Pseudonymized, "@iban:hash", (11, 51)),
+            ];
+        );
+        assert_custom_rulespec!(
+            rule = "@iban:hash";
+            input = "some iban: DE89370400440532013000!";
+            output = "some iban: 8A1248B6F40D38FBC59ADE6AD0DF69C7BB9C936A!";
+            remarks = vec![
+                Remark::with_range(RemarkType::Pseudonymized, "0", (11, 51)),
+            ];
+        );
+    }
+
+    /// To prevent too aggressive scrubbing, we don't scrub valid ibans found inside of a word.
+    #[test]
+    fn test_iban_scrubbing_word_boundaries() {
+        let valid_norwegian_iban = "NO9386011117945".to_string();
+
+        assert_text_rule!(
+            rule = "@iban";
+            input = &format!("some iban: {}!", valid_norwegian_iban);
+            output = "some iban: [iban]!";
+            remarks = vec![Remark::with_range(RemarkType::Substituted, "@iban", (11, 17))];
+        );
+
+        let valid_iban_within_word = format!("foo{}bar", valid_norwegian_iban);
+        assert_rule_not_applied!(
+            rule = "@iban";
+            input = &valid_iban_within_word;
+        );
+    }
+
+    #[test]
+    fn test_invalid_iban_codes() {
+        let mut valid_norwegian_iban = "NO9386011117945".to_string();
+
+        assert_text_rule!(
+            rule = "@iban";
+            input = &format!("some iban: {}!", valid_norwegian_iban);
+            output = "some iban: [iban]!";
+            remarks = vec![Remark::with_range(RemarkType::Substituted, "@iban", (11, 17))];
+        );
+
+        let invalid_norwegian_iban = {
+            valid_norwegian_iban.pop();
+            valid_norwegian_iban
+        };
+
+        // Since norway has the shortest iban, it won't recognize an iban shorter than that.
+        assert_rule_not_applied!(
+            rule = "@iban";
+            input = &format!("some iban: {}!", invalid_norwegian_iban);
+        );
+
+        let mut valid_russian_iban = "RU0204452560040702810412345678901".to_string();
+
+        assert_text_rule!(
+            rule = "@iban";
+            input = &format!("some iban: {}!", valid_russian_iban);
+            output = "some iban: [iban]!";
+            remarks = vec![Remark::with_range(RemarkType::Substituted, "@iban", (11, 17))];
+        );
+
+        let invalid_russian_iban = {
+            valid_russian_iban.push('0');
+            valid_russian_iban
+        };
+
+        // Since russia has the longest iban, it won't recognize an iban longer than that.
+        assert_rule_not_applied!(
+            rule = "@iban";
+            input = &format!("some iban: {}!", invalid_russian_iban);
+        );
+
+        // Don't apply if it doesnt start with two uppercase letters.
+        assert_rule_not_applied!(
+            rule = "@iban";
+            input = "some iban: N19386011117945!";
+        );
+    }
+
+    #[test]
+    fn test_valid_iban_codes() {
+        // list taken from: `https://github.com/jschaedl/iban-validation/blob/master/tests/ValidatorTest.php`
+        // Randomized the digits in case of PII.
+
+        let valid_iban_codes = vec![
+            "AD5878942710639732891555",
+            "AE843009416531083386439",
+            "AL57203331634841980876917055",
+            "AT894962316580861740",
+            "AZ20NABZ32222583861167817527",
+            "BA899087481698693720",
+            "BE02622338508282",
+            "BG74BNBG62683163859900",
+            "BH94BMAG81742510166411",
+            "BR6012720184945313263694220C2",
+            "BY42NBRB5423804338230Z59AB39",
+            "CH9094408966251267229",
+            "CR66628293047983395760",
+            "CY07828977709558493944217267",
+            "CZ3250044769520155043487",
+            "DE33286483480880127754",
+            "DK0104500396509359",
+            "DO00BAGR96761901498775724456",
+            "EE270648064710638158",
+            "EG690300132939956610501715864",
+            "ES1855993856250575846003",
+            "FI1536654201409964",
+            "FO7570156750217051",
+            "FR1014777374033381713M74535",
+            "GB24NWBK56308374074647",
+            "GE73NB0994186171721443",
+            "GI49NWBK125988332328154",
+            "GL9054108607699188",
+            "GR5565802405556734747216550",
+            "GT99TRAJ50683085639204647556",
+            "HR6800577821254763445",
+            "HU40379712415496584277966835",
+            "IE81AIBK65375754273298",
+            "IL273293887744694290805",
+            "IQ81NBIQ089246287424886",
+            "IS781608418318734844854556",
+            "IT53X5801219709784172710195",
+            "JO61CBJO9436591471899095231319",
+            "KW43CBKU4883997798760620316108",
+            "KZ51056KZT0837966427",
+            "LB33882243832059959713929005",
+            "LC66HEMM254988987389111701748958",
+            "LI29737657519298857AA",
+            "LT274687648772993442",
+            "LU366704963860370207",
+            "LV56BANK7310410483037",
+            "LY14487832647995492999076",
+            "MC6264639373071228615685245",
+            "MD21AG907990943540501824",
+            "ME03582335388820811523",
+            "MK23858890780702871",
+            "MR9327063831155222861023437",
+            "MT51MALT379454641617MTLCAST058S",
+            "MU03BOMM4322185029224038400MUR",
+            "NL96ABNA5744731632",
+            "NO9058068238671",
+            "PK25SCBL8656172440308193",
+            "PL12349940962957508091419645",
+            "PS76PALS166923702872903852485",
+            "PT14459770251588993280123",
+            "QA18DOHB89519772639156ABCDEFG",
+            "RO17AAAA6B92357725591367",
+            "RS15219225977278176022",
+            "SA5110364369768070892889",
+            "SC23SSCB28695826925340049496USD",
+            "SE1264086862739970624960",
+            "SI02570384665487060",
+            "SK8246443378900295468504",
+            "SM58U9584120480537549943122",
+            "SV18CENR54739364351768235550",
+            "TL666057100094711717888",
+            "TN9055668722925051026777",
+            "TR685596983808399006011173",
+            "UA660626845659376320141789664",
+            "VA02458628330591922762",
+            "VG84VPVG5177475162070855",
+            "XK074179726503194891",
+        ];
+
+        for iban_code in valid_iban_codes {
+            assert_text_rule!(
+                rule = "@iban";
+                input = &format!("some iban: {}!", iban_code);
+                output = "some iban: [iban]!";
+                remarks = vec![Remark::with_range(RemarkType::Substituted, "@iban", (11, 17))];
+            );
+        }
+    }
+
+    #[test]
     fn test_creditcard() {
         assert_text_rule!(
             rule = "@creditcard";
@@ -1016,9 +1298,8 @@ HdmUCGvfKiF2CodxyLon1XkK8pX+Ap86MbJhluqK
             "anything",
         ] {
             for redaction_method in &["mask", "remove", "hash", "replace"] {
-                let key = format!("@{}:{}", rule_type, redaction_method);
-                println!("looking up {}", key);
-                assert!(BUILTIN_RULES.contains(&key.as_str()));
+                let key = format!("@{rule_type}:{redaction_method}");
+                println!("looking up {key}");
                 assert!(BUILTIN_RULES_MAP.contains_key(key.as_str()));
             }
         }

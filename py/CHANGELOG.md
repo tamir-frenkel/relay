@@ -1,5 +1,85 @@
 # Changelog
 
+## 0.8.24
+
+- Compile regexes in PII config validation. ([#2152](https://github.com/getsentry/relay/pull/2152))
+
+## 0.8.23
+
+- Add `txNameReady` flag to project config. ([#2128](https://github.com/getsentry/relay/pull/2128))
+
+## 0.8.22
+
+- Store `geo.subdivision` of the end user location. ([#2058](https://github.com/getsentry/relay/pull/2058))
+- Scrub URLs in span descriptions. ([#2095](https://github.com/getsentry/relay/pull/2095))
+- Add new FFI function for running dynamic sampling. ([#2091](https://github.com/getsentry/relay/pull/2091))
+
+## 0.8.21
+
+- Add a data category for indexed profiles. ([#2051](https://github.com/getsentry/relay/pull/2051))
+
+## 0.8.20
+
+- Add `thread.state` field to protocol. ([#1896](https://github.com/getsentry/relay/pull/1896))
+- Smart trim loggers for Java platforms. ([#1941](https://github.com/getsentry/relay/pull/1941))
+- Perform PII scrubbing on meta's original_value field. ([#1892](https://github.com/getsentry/relay/pull/1892))
+- PII scrub `span.data` by default. ([#1953](https://github.com/getsentry/relay/pull/1953))
+- Scrub sensitive cookies. ([#1951](https://github.com/getsentry/relay/pull/1951))
+- Changes how device class is determined for iPhone devices. Instead of checking processor frequency, the device model is mapped to a device class. ([#1970](https://github.com/getsentry/relay/pull/1970))
+- Don't sanitize transactions if no clustering rules exist and no UUIDs were scrubbed. ([#1976](https://github.com/getsentry/relay/pull/1976))
+- Add iPad support for device.class synthesis in light normalization. ([#2008](https://github.com/getsentry/relay/pull/2008))
+- Include unknown feature flags in project config when serializing it. ([#2040](https://github.com/getsentry/relay/pull/2040))
+
+## 0.8.19
+
+- Protocol validation for source map image type. ([#1869](https://github.com/getsentry/relay/pull/1869))
+- Scrub `span.data.http.query` with default scrubbers. ([#1889](https://github.com/getsentry/relay/pull/1889))
+- Add Cloud Resource context. ([#1854](https://github.com/getsentry/relay/pull/1854))
+- Add a `DataCategory` for monitors (crons). ([#1886](https://github.com/getsentry/relay/pull/1886))
+
+## 0.8.18
+
+- Add `instruction_addr_adjustment` field to `RawStacktrace`. ([#1716](https://github.com/getsentry/relay/pull/1716))
+- Make sure to scrub all the fields with PII. If the fields contain an object, the entire object will be removed. ([#1789](https://github.com/getsentry/relay/pull/1789))
+- Add new schema for dynamic sampling rules. ([#1790](https://github.com/getsentry/relay/pull/1790)
+- Keep meta for removed custom measurements. ([#1815](https://github.com/getsentry/relay/pull/1815))
+
+## 0.8.17
+
+- Add utility function for matching CODEOWNER paths against a stacktrace filepath ([#1746](https://github.com/getsentry/relay/pull/1746))
+
+## 0.8.16
+
+- The minimum required Python version is now 3.8. This release does not contain known breaking changes for Python 3.7, but we no longer guarantee compatibility.
+- Add support for decaying functions in dynamic sampling rules. ([#1692](https://github.com/getsentry/relay/pull/1692))
+- Add Profiling Context to event protocol. ([#1748](https://github.com/getsentry/relay/pull/1748))
+- Add OpenTelemetry Context to event protocol. ([#1617](https://github.com/getsentry/relay/pull/1617))
+- Add `app.in_foreground` and `thread.main` flag to event protocol. ([#1578](https://github.com/getsentry/relay/pull/1578))
+- Scrub all fields with IP addresses rather than only known IP address fields. ([#1725](https://github.com/getsentry/relay/pull/1725))
+- Disallow `-` in measurement and breakdown names. These items are converted to metrics, which do not allow `-` in their name. ([#1571](https://github.com/getsentry/relay/pull/1571))
+- Validate the distribution name in the event. ([#1556](https://github.com/getsentry/relay/pull/1556))
+- Use correct meta object for logentry in light normalization. ([#1577](https://github.com/getsentry/relay/pull/1577))
+
+## 0.8.15
+
+- Restore correct behavior when `is_renormalize` is specified on `normalize_event`. ([#1548](https://github.com/getsentry/relay/pull/1548))
+
+## 0.8.14 [YANKED]
+
+**Warning:** This release contains a regression. Please update to a more recent version.
+
+- Add `transaction_info` to event payloads, including the transaction's source and internal original transaction name. ([#1330](https://github.com/getsentry/relay/pull/1330))
+- Add user-agent parsing to replays processor. ([#1420](https://github.com/getsentry/relay/pull/1420))
+- `convert_datascrubbing_config` will now return an error string when conversion fails on big regexes. ([#1474](https://github.com/getsentry/relay/pull/1474))
+- `relay_pii_strip_event` now treats any key containing `token` as a password. ([#1527](https://github.com/getsentry/relay/pull/1527))
+- Add data category for indexed transactions. This will come to represent stored transactions, while the existing category will represent transaction metrics. ([#1535](https://github.com/getsentry/relay/pull/1535))
+
+## 0.8.13
+
+- Add a data category constant for Replays. ([#1239](https://github.com/getsentry/relay/pull/1239))
+- Add data category constant for processed transactions, encompassing all transactions that have been received and sent through dynamic sampling as well as metrics extraction. ([#1306](https://github.com/getsentry/relay/pull/1306))
+- Extend trace sampling protocol to deal with flat user data. ([#1318](https://github.com/getsentry/relay/pull/1318))
+
 ## 0.8.12
 
 - Fix missing profile data category in the python library of 0.8.11 by regenerating the header for C-bindings. ([#1278](https://github.com/getsentry/relay/pull/1278))

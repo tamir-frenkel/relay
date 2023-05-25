@@ -1,4 +1,5 @@
 # coding: utf-8
+import json
 import sentry_relay
 
 import pytest
@@ -93,12 +94,42 @@ def test_legacy_json():
 
 def test_broken_json():
     normalizer = sentry_relay.StoreNormalizer(project_id=1)
-    bad_str = u"Hello\ud83dWorld🇦🇹!"
+    bad_str = "Hello\ud83dWorld🇦🇹!"
     event = normalizer.normalize_event({"message": bad_str})
     assert "Hello" in event["logentry"]["formatted"]
     assert "World" in event["logentry"]["formatted"]
     if not PY2:
         assert event["logentry"]["formatted"] != bad_str
+
+
+@pytest.mark.parametrize(
+    "must_normalize",
+    [None, False, True],
+)
+def test_normalize_user_agent(must_normalize):
+    normalizer = sentry_relay.StoreNormalizer(
+        project_id=1, normalize_user_agent=must_normalize
+    )
+    event = normalizer.normalize_event(
+        {
+            "request": {
+                "headers": [
+                    [
+                        "User-Agent",
+                        "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:15.0) Gecko/20100101 Firefox/15.0.1",
+                    ],
+                ],
+            },
+        }
+    )
+
+    if must_normalize:
+        assert event["contexts"] == {
+            "browser": {"name": "Firefox", "version": "15.0.1", "type": "browser"},
+            "client_os": {"name": "Ubuntu", "type": "os"},
+        }
+    else:
+        assert "contexts" not in event
 
 
 def test_validate_pii_config():
@@ -209,10 +240,14 @@ def test_validate_sampling_configuration():
     Tests that a valid sampling rule configuration passes
     """
     config = """{
-        "rules": [
+        "rules": [],
+        "rulesV2": [
             {
                 "type": "trace",
-                "sampleRate": 0.7,
+                "samplingValue": {
+                    "type": "sampleRate",
+                    "value": 0.7
+                },
                 "condition": {
                     "op": "custom",
                     "name": "event.legacy_browser",
@@ -222,7 +257,10 @@ def test_validate_sampling_configuration():
             },
             {
                 "type": "trace",
-                "sampleRate": 0.9,
+                "samplingValue": {
+                    "type": "sampleRate",
+                    "value": 0.9
+                },
                 "condition": {
                     "op": "eq",
                     "name": "event.release",
@@ -235,3 +273,225 @@ def test_validate_sampling_configuration():
     }"""
     # Should NOT throw
     sentry_relay.validate_sampling_configuration(config)
+
+
+def test_validate_project_config():
+    config = {"allowedDomains": ["*"], "trustedRelays": [], "piiConfig": None}
+    # Does not raise:
+    sentry_relay.validate_project_config(json.dumps(config), strict=True)
+    config["foobar"] = True
+    with pytest.raises(ValueError) as e:
+        sentry_relay.validate_project_config(json.dumps(config), strict=True)
+    assert str(e.value) == 'json atom at path ".foobar" is missing from rhs'
+
+
+def test_run_dynamic_sampling_with_valid_params_and_match():
+    sampling_config = """{
+       "rules": [],
+       "rulesV2": [
+          {
+             "samplingValue":{
+                "type": "factor",
+                "value": 2.0
+             },
+             "type": "transaction",
+             "active": true,
+             "condition": {
+                "op": "and",
+                "inner": [
+                    {
+                        "op": "eq",
+                        "name": "event.transaction",
+                        "value": [
+                          "/world"
+                        ],
+                        "options": {
+                          "ignoreCase": true
+                        }
+                    }
+                ]
+             },
+             "id": 1000
+          }
+       ],
+       "mode": "received"
+    }"""
+
+    root_sampling_config = """{
+       "rules": [],
+       "rulesV2": [
+          {
+             "samplingValue":{
+                "type": "sampleRate",
+                "value": 0.5
+             },
+             "type": "trace",
+             "active": true,
+             "condition": {
+                "op": "and",
+                "inner": []
+             },
+             "id": 1001
+          }
+       ],
+       "mode": "received"
+    }"""
+
+    dsc = """{
+        "trace_id": "d0303a19-909a-4b0b-a639-b17a74c3533b",
+        "public_key": "abd0f232775f45feab79864e580d160b",
+        "release": "1.0",
+        "environment": "dev",
+        "transaction": "/hello",
+        "replay_id": "d0303a19-909a-4b0b-a639-b17a73c3533b"
+    }"""
+
+    event = """{
+        "type": "transaction",
+        "transaction": "/world"
+    }"""
+
+    result = sentry_relay.run_dynamic_sampling(
+        sampling_config,
+        root_sampling_config,
+        dsc,
+        event,
+    )
+    assert "merged_sampling_configs" in result
+    assert result["sampling_match"] == {
+        "sample_rate": 1.0,
+        "seed": "d0303a19-909a-4b0b-a639-b17a74c3533b",
+        "matched_rule_ids": [1000, 1001],
+    }
+
+
+def test_run_dynamic_sampling_with_valid_params_and_no_match():
+    sampling_config = """{
+       "rules": [],
+       "rulesV2": [],
+       "mode": "received"
+    }"""
+
+    root_sampling_config = """{
+       "rules": [],
+       "rulesV2": [
+          {
+             "samplingValue":{
+                "type": "sampleRate",
+                "value": 0.5
+             },
+             "type": "trace",
+             "active": true,
+             "condition": {
+                "op": "and",
+                "inner": [
+                    {
+                        "op": "eq",
+                        "name": "trace.transaction",
+                        "value": [
+                          "/foo"
+                        ],
+                        "options": {
+                          "ignoreCase": true
+                        }
+                    }
+                ]
+             },
+             "id": 1001
+          }
+       ],
+       "mode": "received"
+    }"""
+
+    dsc = """{
+        "trace_id": "d0303a19-909a-4b0b-a639-b17a74c3533b",
+        "public_key": "abd0f232775f45feab79864e580d160b",
+        "release": "1.0",
+        "environment": "dev",
+        "transaction": "/hello",
+        "replay_id": "d0303a19-909a-4b0b-a639-b17a73c3533b"
+    }"""
+
+    event = """{
+        "type": "transaction",
+        "transaction": "/world"
+    }"""
+
+    result = sentry_relay.run_dynamic_sampling(
+        sampling_config,
+        root_sampling_config,
+        dsc,
+        event,
+    )
+    assert "merged_sampling_configs" in result
+    assert result["sampling_match"] is None
+
+
+def test_run_dynamic_sampling_with_valid_params_and_no_dsc_and_no_event():
+    sampling_config = """{
+       "rules": [],
+       "rulesV2": [],
+       "mode": "received"
+    }"""
+
+    root_sampling_config = """{
+       "rules": [],
+       "rulesV2": [
+          {
+             "samplingValue":{
+                "type": "sampleRate",
+                "value": 0.5
+             },
+             "type": "trace",
+             "active": true,
+             "condition": {
+                "op": "and",
+                "inner": []
+             },
+             "id": 1001
+          }
+       ],
+       "mode": "received"
+    }"""
+
+    dsc = "{}"
+
+    event = "{}"
+
+    result = sentry_relay.run_dynamic_sampling(
+        sampling_config,
+        root_sampling_config,
+        dsc,
+        event,
+    )
+    assert "merged_sampling_configs" in result
+    assert result["sampling_match"] is None
+
+
+def test_run_dynamic_sampling_with_invalid_params():
+    sampling_config = """{
+       "rules": [],
+       "mode": "received"
+    }"""
+
+    root_sampling_config = """{
+       "rules": [],
+       "mode": "received"
+    }"""
+
+    dsc = """{
+        "trace_id": "d0303a19-909a-4b0b-a639-b17a74c3533b",
+    }"""
+
+    event = """{
+        "type": "transaction",
+        "test": "/test"
+    }"""
+
+    with pytest.raises(sentry_relay.InvalidJsonError):
+        sentry_relay.run_dynamic_sampling(
+            sampling_config,
+            root_sampling_config,
+            dsc,
+            event,
+        )

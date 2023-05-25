@@ -1,15 +1,14 @@
 use chrono::{TimeZone, Utc};
-use symbolic_unreal::{
-    Unreal4Context, Unreal4Crash, Unreal4Error, Unreal4ErrorKind, Unreal4FileType, Unreal4LogEntry,
-};
-
 use relay_config::Config;
 use relay_general::protocol::{
     AsPair, Breadcrumb, ClientSdkInfo, Context, Contexts, DeviceContext, Event, EventId,
-    GpuContext, LenientString, LogEntry, Message, OsContext, TagEntry, Tags, Timestamp, User,
-    UserReport, Values,
+    GpuContext, LenientString, Level, LogEntry, Message, OsContext, TagEntry, Tags, Timestamp,
+    User, UserReport, Values,
 };
 use relay_general::types::{self, Annotated, Array, Object, Value};
+use symbolic_unreal::{
+    Unreal4Context, Unreal4Crash, Unreal4Error, Unreal4ErrorKind, Unreal4FileType, Unreal4LogEntry,
+};
 
 use crate::constants::{
     ITEM_NAME_BREADCRUMBS1, ITEM_NAME_BREADCRUMBS2, ITEM_NAME_EVENT, UNREAL_USER_HEADER,
@@ -84,7 +83,8 @@ pub fn expand_unreal_envelope(
 
         let mut item = Item::new(ItemType::Attachment);
         item.set_filename(file.name());
-        item.set_payload(content_type, file.data());
+        // TODO: This clones data. Update symbolic to allow moving the bytes out.
+        item.set_payload(content_type, file.data().to_owned());
         item.set_attachment_type(attachment_type);
         envelope.add_item(item);
     }
@@ -136,7 +136,11 @@ fn merge_unreal_logs(event: &mut Event, data: &[u8]) -> Result<(), Unreal4Error>
     for log in logs {
         let timestamp = log
             .timestamp
-            .map(|ts| Timestamp(Utc.timestamp(ts.unix_timestamp(), ts.nanosecond())));
+            .and_then(|ts| {
+                Utc.timestamp_opt(ts.unix_timestamp(), ts.nanosecond())
+                    .latest()
+            })
+            .map(Timestamp);
 
         breadcrumbs.push(Annotated::new(Breadcrumb {
             timestamp: Annotated::from(timestamp),
@@ -199,7 +203,7 @@ fn merge_unreal_context(event: &mut Event, context: Unreal4Context) {
 
     if let Some(memory_physical) = runtime_props.memory_stats_total_physical.take() {
         let device_context = contexts.get_or_insert_with(DeviceContext::default_key(), || {
-            Context::Device(Box::new(DeviceContext::default()))
+            Context::Device(Box::default())
         });
 
         if let Context::Device(device_context) = device_context {
@@ -209,9 +213,8 @@ fn merge_unreal_context(event: &mut Event, context: Unreal4Context) {
 
     // OS information is likely overwritten by Minidump processing later.
     if let Some(os_major) = runtime_props.misc_os_version_major.take() {
-        let os_context = contexts.get_or_insert_with(OsContext::default_key(), || {
-            Context::Os(Box::new(OsContext::default()))
-        });
+        let os_context =
+            contexts.get_or_insert_with(OsContext::default_key(), || Context::Os(Box::default()));
 
         if let Context::Os(os_context) = os_context {
             os_context.name = Annotated::new(os_major);
@@ -219,13 +222,20 @@ fn merge_unreal_context(event: &mut Event, context: Unreal4Context) {
     }
 
     if let Some(gpu_brand) = runtime_props.misc_primary_gpu_brand.take() {
-        let gpu_context = contexts.get_or_insert_with(GpuContext::default_key(), || {
-            Context::Gpu(Box::new(GpuContext::default()))
-        });
+        let gpu_context =
+            contexts.get_or_insert_with(GpuContext::default_key(), || Context::Gpu(Box::default()));
 
         if let Context::Gpu(gpu_context) = gpu_context {
             gpu_context.name = Annotated::new(gpu_brand);
         }
+    }
+
+    if runtime_props.is_assert.unwrap_or(false) {
+        event.level = Annotated::new(Level::Error)
+    }
+
+    if runtime_props.is_ensure.unwrap_or(false) {
+        event.level = Annotated::new(Level::Warning)
     }
 
     // Modules are not used and later replaced with Modules from the Minidump or Apple Crash Report.
@@ -274,9 +284,9 @@ pub fn process_unreal_envelope(
         .get_header(UNREAL_USER_HEADER)
         .and_then(Value::as_str);
     let context_item =
-        envelope.get_item_by(|item| item.attachment_type() == Some(AttachmentType::UnrealContext));
+        envelope.get_item_by(|item| item.attachment_type() == Some(&AttachmentType::UnrealContext));
     let logs_item =
-        envelope.get_item_by(|item| item.attachment_type() == Some(AttachmentType::UnrealLogs));
+        envelope.get_item_by(|item| item.attachment_type() == Some(&AttachmentType::UnrealLogs));
 
     // Early exit if there is no information.
     if user_header.is_none() && context_item.is_none() && logs_item.is_none() {
@@ -284,7 +294,7 @@ pub fn process_unreal_envelope(
     }
 
     // If we have UE4 info, ensure an event is there to fill. DO NOT fill if there is no unreal
-    // information, or otherwise `EnvelopeProcessor::process` breaks.
+    // information, or otherwise `EnvelopeProcessorService::process` breaks.
     let event = event.get_or_insert_with(Event::default);
 
     if let Some(user_info) = user_header {
@@ -316,10 +326,10 @@ pub fn process_unreal_envelope(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
-    #[test]
-    fn test_merge_unreal_context() {
+    fn get_context() -> Unreal4Context {
         let raw_context = br##"<?xml version="1.0" encoding="UTF-8"?>
 <FGenericCrashContext>
 	<RuntimeProperties>
@@ -348,12 +358,43 @@ mod tests {
 </FGenericCrashContext>
 "##;
 
-        let context = Unreal4Context::parse(raw_context).unwrap();
+        Unreal4Context::parse(raw_context).unwrap()
+    }
+
+    #[test]
+    fn test_merge_unreal_context() {
+        let context = get_context();
         let mut event = Event::default();
 
         merge_unreal_context(&mut event, context);
 
         insta::assert_snapshot!(Annotated::new(event).to_json_pretty().unwrap());
+    }
+
+    #[test]
+    fn test_merge_unreal_context_is_assert_level_error() {
+        let mut context = get_context();
+        let mut runtime_props = context.runtime_properties.as_mut().unwrap();
+        runtime_props.is_assert = Some(true);
+
+        let mut event = Event::default();
+
+        merge_unreal_context(&mut event, context);
+
+        assert_eq!(event.level, Annotated::new(Level::Error));
+    }
+
+    #[test]
+    fn test_merge_unreal_context_is_esure_level_warning() {
+        let mut context = get_context();
+        let mut runtime_props = context.runtime_properties.as_mut().unwrap();
+        runtime_props.is_ensure = Some(true);
+
+        let mut event = Event::default();
+
+        merge_unreal_context(&mut event, context);
+
+        assert_eq!(event.level, Annotated::new(Level::Warning));
     }
 
     #[test]

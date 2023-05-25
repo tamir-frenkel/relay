@@ -61,7 +61,7 @@ impl fmt::Debug for RetryAfter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.remaining_seconds() {
             0 => write!(f, "RetryAfter(expired)"),
-            remaining => write!(f, "RetryAfter({}s)", remaining),
+            remaining => write!(f, "RetryAfter({remaining}s)"),
         }
     }
 }
@@ -261,7 +261,7 @@ impl RateLimits {
         for quota in quotas {
             if quota.limit == Some(0) && quota.matches(scoping) {
                 let retry_after = RetryAfter::from_secs(REJECT_ALL_SECS);
-                applied_limits.add(RateLimit::from_quota(quota, &*scoping, retry_after));
+                applied_limits.add(RateLimit::from_quota(quota, &scoping, retry_after));
             }
         }
 
@@ -342,9 +342,10 @@ impl<'a> IntoIterator for &'a RateLimits {
 
 #[cfg(test)]
 mod tests {
+    use smallvec::smallvec;
+
     use super::*;
     use crate::quota::DataCategory;
-    use smallvec::smallvec;
 
     #[test]
     fn test_parse_retry_after() {

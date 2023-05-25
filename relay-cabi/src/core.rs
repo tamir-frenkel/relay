@@ -1,9 +1,6 @@
 use std::ffi::CStr;
-use std::mem;
 use std::os::raw::c_char;
-use std::ptr;
-use std::slice;
-use std::str;
+use std::{mem, ptr, slice, str};
 
 use relay_common::Uuid;
 
@@ -153,7 +150,7 @@ pub unsafe extern "C" fn relay_uuid_is_nil(uuid: *const RelayUuid) -> bool {
 #[relay_ffi::catch_unwind]
 pub unsafe extern "C" fn relay_uuid_to_str(uuid: *const RelayUuid) -> RelayStr {
     let uuid = Uuid::from_slice(&(*uuid).data[..]).unwrap_or_else(|_| Uuid::nil());
-    RelayStr::from_string(uuid.to_hyphenated_ref().to_string())
+    RelayStr::from_string(uuid.as_hyphenated().to_string())
 }
 
 /// A binary buffer of known length.

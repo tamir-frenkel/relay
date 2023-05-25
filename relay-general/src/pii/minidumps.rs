@@ -6,7 +6,6 @@ use std::num::TryFromIntError;
 use std::ops::Range;
 use std::str::Utf8Error;
 
-use failure::Fail;
 use minidump::format::{
     CvSignature, MINIDUMP_LOCATION_DESCRIPTOR, MINIDUMP_STREAM_TYPE as StreamType,
 };
@@ -20,30 +19,24 @@ use utf16string::{Utf16Error, WStr};
 use crate::pii::{PiiAttachmentsProcessor, ScrubEncodings};
 use crate::processor::{FieldAttrs, Pii, ValueType};
 
-#[derive(Debug, Fail)]
+#[derive(Debug, thiserror::Error)]
 pub enum ScrubMinidumpError {
-    #[fail(display = "failed to parse minidump")]
-    InvalidMinidump(#[cause] MinidumpError),
+    #[error("failed to parse minidump")]
+    InvalidMinidump(#[from] MinidumpError),
 
-    #[fail(display = "invalid memory address")]
+    #[error("invalid memory address")]
     InvalidAddress,
 
-    #[fail(display = "minidump offsets out of usize range")]
+    #[error("minidump offsets out of usize range")]
     OutOfRange,
 
-    #[fail(display = "string decoding error")]
+    #[error("string decoding error")]
     Decoding,
 }
 
 impl From<TryFromIntError> for ScrubMinidumpError {
     fn from(_source: TryFromIntError) -> Self {
         Self::OutOfRange
-    }
-}
-
-impl From<MinidumpError> for ScrubMinidumpError {
-    fn from(source: MinidumpError) -> Self {
-        Self::InvalidMinidump(source)
     }
 }
 
@@ -140,7 +133,7 @@ impl<'a> MinidumpData<'a> {
         &self,
         stream_type: StreamType,
     ) -> Result<Option<Range<usize>>, ScrubMinidumpError> {
-        let range = match self.minidump.get_raw_stream(stream_type) {
+        let range = match self.minidump.get_raw_stream(stream_type.into()) {
             Ok(stream) => Some(
                 self.slice_range(stream)
                     .ok_or(ScrubMinidumpError::InvalidAddress)?,
@@ -190,7 +183,11 @@ impl<'a> MinidumpData<'a> {
             } else {
                 rvas.push(rva);
             }
-            let len: usize = u32_from_bytes(&self.data[rva..], self.minidump.endian)?.try_into()?;
+            let len_bytes = self
+                .data
+                .get(rva..)
+                .ok_or(ScrubMinidumpError::InvalidAddress)?;
+            let len: usize = u32_from_bytes(len_bytes, self.minidump.endian)?.try_into()?;
             let start: usize = rva + 4;
             items.push(MinidumpItem::CodeModuleName(start..start + len));
 
@@ -198,7 +195,11 @@ impl<'a> MinidumpData<'a> {
             let codeview_loc = module.raw.cv_record;
             let cv_start: usize = codeview_loc.rva.try_into()?;
             let cv_len: usize = codeview_loc.data_size.try_into()?;
-            let signature = u32_from_bytes(&self.data[cv_start..], self.minidump.endian)?;
+            let signature_bytes = self
+                .data
+                .get(cv_start..)
+                .ok_or(ScrubMinidumpError::InvalidAddress)?;
+            let signature = u32_from_bytes(signature_bytes, self.minidump.endian)?;
             match CvSignature::from_u32(signature) {
                 Some(CvSignature::Pdb70) => {
                     let offset: usize = 4 + (4 + 2 + 2 + 8) + 4; // cv_sig + sig GUID + age
@@ -321,11 +322,11 @@ impl PiiAttachmentsProcessor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use minidump::{format::RVA, MinidumpModule, Module};
-
-    use crate::pii::PiiConfig;
+    use minidump::format::RVA;
+    use minidump::{MinidumpModule, Module};
 
     use super::*;
+    use crate::pii::PiiConfig;
 
     struct TestScrubber {
         orig_dump: Minidump<'static, &'static [u8]>,
@@ -339,8 +340,7 @@ mod tests {
             let mut scrubbed_data = Vec::from(orig_data);
 
             let config = serde_json::from_value::<PiiConfig>(json).expect("invalid config json");
-            let compiled = config.compiled();
-            let processor = PiiAttachmentsProcessor::new(&compiled);
+            let processor = PiiAttachmentsProcessor::new(config.compiled());
             processor
                 .scrub_minidump(filename, scrubbed_data.as_mut_slice())
                 .expect("scrubbing failed");
@@ -438,7 +438,8 @@ mod tests {
                 Which::Original => &self.orig_dump,
                 Which::Scrubbed => &self.scrubbed_dump,
             };
-            dump.get_raw_stream(StreamType::LinuxEnviron).unwrap()
+            dump.get_raw_stream(StreamType::LinuxEnviron.into())
+                .unwrap()
         }
     }
 

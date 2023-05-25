@@ -1,4 +1,4 @@
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use smallvec::{smallvec, SmallVec};
 
@@ -52,11 +52,13 @@ pub fn get_regex_for_rule_type(
     let kv = PatternType::KeyValue;
 
     match ty {
-        RuleType::RedactPair(ref redact_pair) => smallvec![(
-            kv,
-            &redact_pair.key_pattern.0,
-            ReplaceBehavior::replace_value()
-        )],
+        RuleType::RedactPair(ref redact_pair) => {
+            if let Ok(pattern) = redact_pair.key_pattern.compiled() {
+                smallvec![(kv, pattern, ReplaceBehavior::replace_value())]
+            } else {
+                smallvec![]
+            }
+        }
         RuleType::Password => {
             smallvec![(kv, &*PASSWORD_KEY_REGEX, ReplaceBehavior::replace_value())]
         }
@@ -68,14 +70,18 @@ pub fn get_regex_for_rule_type(
                 }
                 None => ReplaceBehavior::replace_match(),
             };
-
-            smallvec![(v, &r.pattern.0, replace_behavior)]
+            if let Ok(pattern) = r.pattern.compiled() {
+                smallvec![(v, pattern, replace_behavior)]
+            } else {
+                smallvec![]
+            }
         }
 
         RuleType::Imei => smallvec![(v, &*IMEI_REGEX, ReplaceBehavior::replace_match())],
         RuleType::Mac => smallvec![(v, &*MAC_REGEX, ReplaceBehavior::replace_match())],
         RuleType::Uuid => smallvec![(v, &*UUID_REGEX, ReplaceBehavior::replace_match())],
         RuleType::Email => smallvec![(v, &*EMAIL_REGEX, ReplaceBehavior::replace_match())],
+        RuleType::Iban => smallvec![(v, &*IBAN_REGEX, ReplaceBehavior::replace_match())],
         RuleType::Ip => smallvec![
             (v, &*IPV4_REGEX, ReplaceBehavior::replace_match()),
             (v, &*IPV6_REGEX, ReplaceBehavior::replace_group(1)),
@@ -89,7 +95,7 @@ pub fn get_regex_for_rule_type(
         RuleType::Userpath => smallvec![(v, &*PATH_REGEX, ReplaceBehavior::replace_group(1))],
 
         // These ought to have been resolved in CompiledConfig
-        RuleType::Alias(_) | RuleType::Multiple(_) => smallvec![],
+        RuleType::Alias(_) | RuleType::Multiple(_) | RuleType::Unknown(_) => smallvec![],
     }
 }
 
@@ -100,10 +106,10 @@ macro_rules! ip {
     (v6s) => { "[0-9a-fA-F]{1,4}" };
 }
 
-#[rustfmt::skip]
-lazy_static! {
-    pub static ref ANYTHING_REGEX: Regex = Regex::new(".*").unwrap();
-    static ref IMEI_REGEX: Regex = Regex::new(
+pub static ANYTHING_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(".*").unwrap());
+
+static IMEI_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
         r#"(?x)
             \b
                 (\d{2}-?
@@ -111,14 +117,22 @@ lazy_static! {
                  \d{6}-?
                  \d{1,2})
             \b
-        "#
-    ).unwrap();
-    static ref MAC_REGEX: Regex = Regex::new(
+        "#,
+    )
+    .unwrap()
+});
+
+static MAC_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
         r#"(?x)
             \b([[:xdigit:]]{2}[:-]){5}[[:xdigit:]]{2}\b
-        "#
-    ).unwrap();
-    static ref UUID_REGEX: Regex = Regex::new(
+        "#,
+    )
+    .unwrap()
+});
+
+static UUID_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
         r#"(?ix)
             \b
             [a-z0-9]{8}-?
@@ -127,19 +141,40 @@ lazy_static! {
             [a-z0-9]{4}-?
             [a-z0-9]{12}
             \b
-        "#
-    ).unwrap();
-    static ref EMAIL_REGEX: Regex = Regex::new(
+        "#,
+    )
+    .unwrap()
+});
+
+static EMAIL_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
         r#"(?x)
             \b
                 [a-zA-Z0-9.!\#$%&'*+/=?^_`{|}~-]+
                 @
                 [a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*
             \b
-        "#
-    ).unwrap();
-    static ref IPV4_REGEX: Regex = Regex::new(concat!("\\b", ip!(v4a), "\\b")).unwrap();
-    static ref IPV6_REGEX: Regex = Regex::new(
+        "#,
+    )
+    .unwrap()
+});
+
+static IBAN_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?x)
+            \b
+            (AT|AD|AE|AL|AZ|BA|BE|BG|BH|BR|BY|CH|CR|CY|CZ|DE|DK|DO|EE|EG|ES|FI|FO|FR|GB|GE|GI|GL|GR|GT|HR|HU|IE|IL|IQ|IS|IT|JO|KW|KZ|LB|LC|LI|LT|LU|LV|LY|MC|MD|ME|MK|MR|MT|MU|NL|NO|PK|PL|PS|PT|QA|RO|RU|RS|SA|SC|SE|SI|SK|SM|ST|SV|TL|TN|TR|UA|VA|VG|XK|DZ|AO|BJ|BF|BI|CV|CM|CF|TD|KM|CG|CI|DJ|GQ|GA|GW|HN|IR|MG|ML|MA|MZ|NI|NE|SN|TG)\d{2}[a-zA-Z0-9]{11,29}
+            \b
+        "#,
+    )
+    .unwrap()
+});
+
+static IPV4_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(concat!("\\b", ip!(v4a), "\\b")).unwrap());
+
+#[rustfmt::skip]
+static  IPV6_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
         concat!(
             "(?i)(?:[\\s]|[[:punct:]]|^)(",
                 "(", ip!(v6s), ":){7}", ip!(v6s), "|",
@@ -156,14 +191,16 @@ lazy_static! {
                 "(", ip!(v6s), ":){1,4}:", ip!(v4a),
             ")([\\s]|[[:punct:]]|$)",
         )
-    ).unwrap();
+    ).unwrap()
+});
 
-    // http://www.richardsramblings.com/regex/credit-card-numbers/
-    // Re-formatted with comments and dashes support
-    //
-    // Why so complicated? Because creditcard numbers are variable length and we do not want to
-    // strip any number that just happens to have the same length.
-    static ref CREDITCARD_REGEX: Regex = Regex::new(
+// http://www.richardsramblings.com/regex/credit-card-numbers/
+// Re-formatted with comments and dashes support
+//
+// Why so complicated? Because creditcard numbers are variable length and we do not want to
+// strip any number that just happens to have the same length.
+static CREDITCARD_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
         r#"(?x)
         \b(
             (?:  # vendor specific prefixes
@@ -177,9 +214,13 @@ lazy_static! {
             # "wildcard" remainder (allowing dashes in every position because of variable length)
             ([-\s]?\d){12}
         )\b
-        "#
-    ).unwrap();
-    static ref PATH_REGEX: Regex = Regex::new(
+        "#,
+    )
+    .unwrap()
+});
+
+static PATH_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
         r#"(?ix)
             (?:
                 (?:
@@ -192,9 +233,13 @@ lazy_static! {
             (
                 [^/\\]+
             )
-        "#
-    ).unwrap();
-    static ref PEM_KEY_REGEX: Regex = Regex::new(
+        "#,
+    )
+    .unwrap()
+});
+
+static PEM_KEY_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
         r#"(?sx)
             (?:
                 -----
@@ -209,26 +254,38 @@ lazy_static! {
                 END[A-Z\ ]+(?:PRIVATE|PUBLIC)\ KEY
                 -----
             )
-        "#
-    ).unwrap();
-    static ref URL_AUTH_REGEX: Regex = Regex::new(
+        "#,
+    )
+    .unwrap()
+});
+
+static URL_AUTH_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
         r#"(?x)
             \b(?:
                 (?:[a-z0-9+-]+:)?//
                 ([a-zA-Z0-9%_.-]+(?::[a-zA-Z0-9%_.-]+)?)
             )@
-        "#
-    ).unwrap();
-    static ref US_SSN_REGEX: Regex = Regex::new(
+        "#,
+    )
+    .unwrap()
+});
+
+static US_SSN_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
         r#"(?x)
             \b(
                 [0-9]{3}-
                 [0-9]{2}-
                 [0-9]{4}
             )\b
-        "#
-    ).unwrap();
-    static ref PASSWORD_KEY_REGEX: Regex = Regex::new(
-        r"(?i)(password|secret|passwd|api_key|apikey|access_token|auth|credentials|mysql_pwd|stripetoken)"
-    ).unwrap();
-}
+        "#,
+    )
+    .unwrap()
+});
+
+static PASSWORD_KEY_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)(password|secret|passwd|api_key|apikey|auth|credentials|mysql_pwd|privatekey|private_key|token)"
+    ).unwrap()
+});

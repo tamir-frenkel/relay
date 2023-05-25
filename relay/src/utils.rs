@@ -1,22 +1,12 @@
 use std::fmt::Display;
 use std::str::FromStr;
 
-use console::Style;
-use dialoguer::Input;
-use failure::Error;
-use lazy_static::lazy_static;
-
+use anyhow::Result;
 use dialoguer::theme::{ColorfulTheme, Theme};
+use dialoguer::Input;
+use once_cell::sync::Lazy;
 
-lazy_static! {
-    static ref THEME: ColorfulTheme = ColorfulTheme {
-        values_style: Style::new().cyan().dim(),
-        indicator_style: Style::new().cyan().bold(),
-        yes_style: Style::new().cyan().dim(),
-        no_style: Style::new().cyan().dim(),
-        ..ColorfulTheme::default()
-    };
-}
+static THEME: Lazy<ColorfulTheme> = Lazy::new(ColorfulTheme::default);
 
 /// Returns the theme to use.
 pub fn get_theme() -> &'static dyn Theme {
@@ -24,7 +14,7 @@ pub fn get_theme() -> &'static dyn Theme {
 }
 
 /// Prompts for a value that has a default.
-pub fn prompt_value<V: FromStr + Display>(name: &str, v: &mut V) -> Result<(), Error>
+pub fn prompt_value<V: FromStr + Display>(name: &str, v: &mut V) -> Result<()>
 where
     <V as FromStr>::Err: Display,
 {
@@ -39,7 +29,7 @@ where
                 return Ok(());
             }
             Err(err) => {
-                println!("  invalid input: {}", err);
+                println!("  invalid input: {err}");
                 continue;
             }
         }
@@ -47,7 +37,7 @@ where
 }
 
 /// Prompts for a value without a default.
-pub fn prompt_value_no_default<V: FromStr + Display>(name: &str) -> Result<V, Error>
+pub fn prompt_value_no_default<V: FromStr + Display>(name: &str) -> Result<V>
 where
     <V as FromStr>::Err: Display,
 {
@@ -60,7 +50,7 @@ where
                 return Ok(value);
             }
             Err(err) => {
-                println!("  invalid input: {}", err);
+                println!("  invalid input: {err}");
                 continue;
             }
         }

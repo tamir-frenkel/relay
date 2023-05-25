@@ -171,6 +171,7 @@ trait StringMods: AsRef<[u8]> {
             Redaction::Replace(ref replace) => {
                 self.swap_content(replace.text.as_str(), PADDING);
             }
+            Redaction::Other => relay_log::warn!("Incoming redaction is not supported"),
         }
     }
 }
@@ -506,9 +507,8 @@ impl<'a> PiiAttachmentsProcessor<'a> {
 mod tests {
     use itertools::Itertools;
 
-    use crate::pii::PiiConfig;
-
     use super::*;
+    use crate::pii::PiiConfig;
 
     enum AttachmentBytesTestCase<'a> {
         Builtin {
@@ -533,7 +533,7 @@ mod tests {
 
     impl<'a> AttachmentBytesTestCase<'a> {
         fn run(self) {
-            let (config, filename, value_type, input, output, changed) = match self {
+            let (config, filename, value_type, input, expected, changed) = match self {
                 AttachmentBytesTestCase::Builtin {
                     selector,
                     rule,
@@ -583,13 +583,19 @@ mod tests {
                 }
             };
 
-            let compiled = config.compiled();
-            let mut data = input.to_owned();
-            let processor = PiiAttachmentsProcessor::new(&compiled);
+            let mut actual = input.to_owned();
+            let processor = PiiAttachmentsProcessor::new(config.compiled());
             let state = processor.state(filename, value_type);
-            let has_changed = processor.scrub_bytes(&mut data, &state, ScrubEncodings::All);
+            let has_changed = processor.scrub_bytes(&mut actual, &state, ScrubEncodings::All);
 
-            assert_eq_bytes_str!(data, output);
+            assert!(
+                actual == expected,
+                "`actual == expected` in line {}:\n{}\n{}",
+                line!(),
+                pretty_hex::pretty_hex(&actual),
+                pretty_hex::pretty_hex(&expected),
+            );
+
             assert_eq!(changed, has_changed);
         }
     }
@@ -774,7 +780,7 @@ mod tests {
 
             AttachmentBytesTestCase::Regex {
                 selector: "$binary",
-                regex: &bytes.iter().map(|x| format!("\\x{:02x}", x)).join(""),
+                regex: &bytes.iter().map(|x| format!("\\x{x:02x}")).join(""),
                 filename: "foo.txt",
                 value_type: ValueType::Binary,
                 input: bytes,

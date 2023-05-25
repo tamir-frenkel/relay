@@ -1,17 +1,21 @@
-use actix_web::multipart::{Multipart, MultipartItem};
-use actix_web::{actix::ResponseFuture, HttpMessage, HttpRequest, HttpResponse};
-use bytes::Bytes;
-use futures::{future, Future, Stream};
+use std::convert::Infallible;
 
+use axum::extract::{DefaultBodyLimit, Multipart};
+use axum::http::Request;
+use axum::response::IntoResponse;
+use axum::routing::{post, MethodRouter};
+use axum::RequestExt;
+use bytes::Bytes;
+use futures::{future, FutureExt};
+use relay_config::Config;
 use relay_general::protocol::EventId;
 
-use crate::body::RequestBody;
 use crate::constants::{ITEM_NAME_BREADCRUMBS1, ITEM_NAME_BREADCRUMBS2, ITEM_NAME_EVENT};
-use crate::endpoints::common::{self, BadStoreRequest};
+use crate::endpoints::common::{self, BadStoreRequest, TextResponse};
 use crate::envelope::{AttachmentType, ContentType, Envelope, Item, ItemType};
-use crate::extractors::RequestMeta;
-use crate::service::{ServiceApp, ServiceState};
-use crate::utils::{consume_field, get_multipart_boundary, MultipartError, MultipartItems};
+use crate::extractors::{RawContentType, RequestMeta};
+use crate::service::ServiceState;
+use crate::utils;
 
 /// The field name of a minidump in the multipart form-data upload.
 ///
@@ -50,154 +54,120 @@ fn infer_attachment_type(field_name: Option<&str>) -> AttachmentType {
     }
 }
 
-fn get_embedded_minidump(
-    payload: Bytes,
-    max_size: usize,
-) -> ResponseFuture<Option<Bytes>, BadStoreRequest> {
-    let boundary = match get_multipart_boundary(&payload) {
+/// Extract a minidump from a nested multipart form.
+///
+/// This field is not a minidump (i.e. it doesn't start with the minidump magic header). It could be
+/// a multipart field containing a minidump; this happens in old versions of the Linux Electron SDK.
+///
+/// Unfortunately, the embedded multipart field is not recognized by the multipart parser as a
+/// multipart field containing a multipart body. For this case we will look if the field starts with
+/// a '--' and manually extract the boundary (which is what follows '--' up to the end of line) and
+/// manually construct a multipart with the detected boundary. If we can extract a multipart with an
+/// embedded minidump, then use that field.
+async fn extract_embedded_minidump(payload: Bytes) -> Result<Option<Bytes>, BadStoreRequest> {
+    let boundary = match utils::get_multipart_boundary(&payload) {
         Some(boundary) => boundary,
-        None => return Box::new(future::ok(None)),
+        None => return Ok(None),
     };
 
-    let f = Multipart::new(Ok(boundary.to_string()), futures::stream::once(Ok(payload)))
-        .map_err(MultipartError::InvalidMultipart)
-        .filter_map(|item| {
-            if let MultipartItem::Field(field) = item {
-                if let Some(content_disposition) = field.content_disposition() {
-                    if content_disposition.get_name() == Some(MINIDUMP_FIELD_NAME) {
-                        return Some(field);
-                    }
-                }
-            }
-            None
-        })
-        .and_then(move |field| consume_field(field, max_size))
-        .into_future()
-        .map_err(|(err, _)| BadStoreRequest::InvalidMultipart(err))
-        .map(|(data, _)| data.map(Bytes::from));
+    let stream = future::ok::<_, Infallible>(payload.clone()).into_stream();
+    let mut multipart = multer::Multipart::new(stream, boundary);
 
-    Box::new(f)
+    while let Some(field) = multipart.next_field().await? {
+        if field.name() == Some(MINIDUMP_FIELD_NAME) {
+            return Ok(Some(field.bytes().await?));
+        }
+    }
+
+    Ok(None)
 }
 
-/// Creates an evelope from a minidump request.
-///
-/// Minidump request payloads do not have the same structure as usual
-/// events from other SDKs.
-///
-/// The minidump can either be transmitted as the request body, or as
-/// `upload_file_minidump` in a multipart form-data/ request.
-///
-/// Optionally, an event payload can be sent in the `sentry` form
-/// field, either as JSON or as nested form data.
-fn extract_envelope(
-    request: &HttpRequest<ServiceState>,
+async fn extract_multipart(
+    config: &Config,
+    multipart: Multipart,
     meta: RequestMeta,
-) -> ResponseFuture<Envelope, BadStoreRequest> {
-    let max_single_size = request.state().config().max_attachment_size();
-    let max_multipart_size = request.state().config().max_attachments_size();
+) -> Result<Box<Envelope>, BadStoreRequest> {
+    let max_size = config.max_attachment_size();
+    let mut items = utils::multipart_items(multipart, max_size, infer_attachment_type).await?;
 
+    let minidump_item = items
+        .iter_mut()
+        .find(|item| item.attachment_type() == Some(&AttachmentType::Minidump))
+        .ok_or(BadStoreRequest::MissingMinidump)?;
+
+    let embedded_opt = extract_embedded_minidump(minidump_item.payload()).await?;
+    if let Some(embedded) = embedded_opt {
+        minidump_item.set_payload(ContentType::Minidump, embedded);
+    }
+
+    validate_minidump(&minidump_item.payload())?;
+
+    let event_id = common::event_id_from_items(&items)?.unwrap_or_else(EventId::new);
+    let mut envelope = Envelope::from_request(Some(event_id), meta);
+
+    for item in items {
+        envelope.add_item(item);
+    }
+
+    Ok(envelope)
+}
+
+fn extract_raw_minidump(data: Bytes, meta: RequestMeta) -> Result<Box<Envelope>, BadStoreRequest> {
+    validate_minidump(&data)?;
+
+    let mut item = Item::new(ItemType::Attachment);
+    item.set_payload(ContentType::Minidump, data);
+    item.set_filename(MINIDUMP_FILE_NAME);
+    item.set_attachment_type(AttachmentType::Minidump);
+
+    // Create an envelope with a random event id.
+    let mut envelope = Envelope::from_request(Some(EventId::new()), meta);
+    envelope.add_item(item);
+    Ok(envelope)
+}
+
+async fn handle<B>(
+    state: ServiceState,
+    meta: RequestMeta,
+    content_type: RawContentType,
+    request: Request<B>,
+) -> axum::response::Result<impl IntoResponse>
+where
+    B: axum::body::HttpBody + Send + 'static,
+    B::Data: Send + Into<Bytes>,
+    B::Error: Into<axum::BoxError>,
+{
+    // The minidump can either be transmitted as the request body, or as
+    // `upload_file_minidump` in a multipart form-data/ request.
     // Minidump request payloads do not have the same structure as usual events from other SDKs. The
     // minidump can either be transmitted as request body, or as `upload_file_minidump` in a
     // multipart formdata request.
-    if MINIDUMP_RAW_CONTENT_TYPES.contains(&request.content_type()) {
-        let future = RequestBody::new(request, max_single_size)
-            .map_err(|_| BadStoreRequest::InvalidMinidump)
-            .and_then(move |data| {
-                validate_minidump(&data)?;
+    let envelope = if MINIDUMP_RAW_CONTENT_TYPES.contains(&content_type.as_ref()) {
+        extract_raw_minidump(request.extract().await?, meta)?
+    } else {
+        extract_multipart(state.config(), request.extract().await?, meta).await?
+    };
 
-                let mut item = Item::new(ItemType::Attachment);
-                item.set_payload(ContentType::Minidump, data);
-                item.set_filename(MINIDUMP_FILE_NAME);
-                item.set_attachment_type(AttachmentType::Minidump);
+    let id = envelope.event_id();
 
-                // Create an envelope with a random event id.
-                let mut envelope = Envelope::from_request(Some(EventId::new()), meta);
-                envelope.add_item(item);
-                Ok(envelope)
-            });
+    // Never respond with a 429 since clients often retry these
+    match common::handle_envelope(&state, envelope).await {
+        Ok(_) | Err(BadStoreRequest::RateLimited(_)) => (),
+        Err(error) => return Err(error.into()),
+    };
 
-        return Box::new(future);
-    }
-
-    let future = MultipartItems::new(max_multipart_size)
-        .infer_attachment_type(infer_attachment_type)
-        .handle_request(request)
-        .map_err(BadStoreRequest::InvalidMultipart)
-        .and_then(move |mut items| {
-            let minidump_index = items
-                .iter()
-                .position(|item| item.attachment_type() == Some(AttachmentType::Minidump));
-
-            let mut minidump_item = match minidump_index {
-                Some(index) => items.swap_remove(index),
-                None => {
-                    return Box::new(future::err(BadStoreRequest::MissingMinidump))
-                        as ResponseFuture<_, _>
-                }
-            };
-
-            // HACK !!
-            //
-            // This field is not a minidump (.i.e. it doesn't start with the minidump magic header).
-            // It could be a multipart field containing a minidump; this happens in old versions of
-            // the Linux Electron SDK.
-            //
-            // Unfortunately, the embedded multipart field is not recognized by the multipart parser
-            // as a multipart field containing a multipart body. For this case we will look if field
-            // the field starts with a '--' and manually extract the boundary (which is what follows
-            // '--' up to the end of line) and manually construct a multipart with the detected
-            // boundary. If we can extract a multipart with an embedded minidump, then use that
-            // field.
-            let future = get_embedded_minidump(minidump_item.payload(), max_single_size).and_then(
-                move |embedded_opt| {
-                    if let Some(embedded) = embedded_opt {
-                        minidump_item.set_payload(ContentType::Minidump, embedded);
-                    }
-
-                    validate_minidump(&minidump_item.payload())?;
-                    items.push(minidump_item);
-
-                    Ok(items)
-                },
-            );
-
-            Box::new(future)
-        })
-        .and_then(move |items| {
-            let event_id = common::event_id_from_items(&items)?.unwrap_or_else(EventId::new);
-            let mut envelope = Envelope::from_request(Some(event_id), meta);
-
-            for item in items {
-                envelope.add_item(item);
-            }
-
-            Ok(envelope)
-        });
-
-    Box::new(future)
+    // The return here is only useful for consistency because the UE4 crash reporter doesn't
+    // care about it.
+    Ok(TextResponse(id))
 }
 
-fn store_minidump(
-    meta: RequestMeta,
-    request: HttpRequest<ServiceState>,
-) -> ResponseFuture<HttpResponse, BadStoreRequest> {
-    common::handle_store_like_request(
-        meta,
-        request,
-        extract_envelope,
-        common::create_text_event_id_response,
-        false, // Never respond with a 429 since clients often retry these
-    )
-}
-
-pub fn configure_app(app: ServiceApp) -> ServiceApp {
-    common::cors(app)
-        // No mandatory trailing slash here because people already use it like this.
-        .resource(&common::normpath(r"/api/{project:\d+}/minidump"), |r| {
-            r.name("store-minidump");
-            r.post().with(store_minidump);
-        })
-        .register()
+pub fn route<B>(config: &Config) -> MethodRouter<ServiceState, B>
+where
+    B: axum::body::HttpBody + Send + 'static,
+    B::Data: Send + Into<Bytes>,
+    B::Error: Into<axum::BoxError>,
+{
+    post(handle).route_layer(DefaultBodyLimit::max(config.max_attachments_size()))
 }
 
 #[cfg(test)]

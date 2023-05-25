@@ -1,4 +1,6 @@
-use crate::protocol::{JsonLenientString, OperationType, SpanId, SpanStatus, Timestamp, TraceId};
+use crate::protocol::{
+    JsonLenientString, OperationType, OriginType, SpanId, SpanStatus, Timestamp, TraceId,
+};
 use crate::types::{Annotated, Object, Value};
 
 #[derive(Clone, Debug, Default, PartialEq, Empty, FromValue, IntoValue, ProcessValue)]
@@ -43,8 +45,12 @@ pub struct Span {
     #[metastructure(pii = "maybe")]
     pub tags: Annotated<Object<JsonLenientString>>,
 
+    /// The origin of the span indicates what created the span (see [OriginType] docs).
+    #[metastructure(max_chars = "enumlike", allow_chars = "a-zA-Z0-9_.")]
+    pub origin: Annotated<OriginType>,
+
     /// Arbitrary additional data on a span, like `extra` on the top-level event.
-    #[metastructure(pii = "maybe")]
+    #[metastructure(pii = "true")]
     pub data: Annotated<Object<Value>>,
 
     // TODO remove retain when the api stabilizes
@@ -55,8 +61,10 @@ pub struct Span {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::{TimeZone, Utc};
+    use similar_asserts::assert_eq;
+
+    use super::*;
 
     #[test]
     fn test_span_serialization() {
@@ -68,23 +76,27 @@ mod tests {
   "op": "operation",
   "span_id": "fa90fdead5f74052",
   "trace_id": "4c79f60c11214eb38604f4ae0781bfb2",
-  "status": "ok"
+  "status": "ok",
+  "origin": "auto.http"
 }"#;
 
         let span = Annotated::new(Span {
-            timestamp: Annotated::new(Utc.ymd(1970, 1, 1).and_hms_nano(0, 0, 0, 0).into()),
-            start_timestamp: Annotated::new(Utc.ymd(1968, 1, 1).and_hms_nano(0, 0, 0, 0).into()),
+            timestamp: Annotated::new(Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap().into()),
+            start_timestamp: Annotated::new(
+                Utc.with_ymd_and_hms(1968, 1, 1, 0, 0, 0).unwrap().into(),
+            ),
             exclusive_time: Annotated::new(1.23),
             description: Annotated::new("desc".to_owned()),
             op: Annotated::new("operation".to_owned()),
             trace_id: Annotated::new(TraceId("4c79f60c11214eb38604f4ae0781bfb2".into())),
             span_id: Annotated::new(SpanId("fa90fdead5f74052".into())),
             status: Annotated::new(SpanStatus::Ok),
+            origin: Annotated::new("auto.http".to_owned()),
             ..Default::default()
         });
-        assert_eq_str!(json, span.to_json_pretty().unwrap());
+        assert_eq!(json, span.to_json_pretty().unwrap());
 
         let span_from_string = Annotated::from_json(json).unwrap();
-        assert_eq_dbg!(span, span_from_string);
+        assert_eq!(span, span_from_string);
     }
 }

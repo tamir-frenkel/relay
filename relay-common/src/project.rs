@@ -1,8 +1,60 @@
 use std::fmt;
 use std::str::FromStr;
 
-#[doc(inline)]
-pub use sentry_types::ProjectId;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::macros::impl_str_serde;
+
+/// Raised if a project ID cannot be parsed from a string.
+#[derive(Debug, Error, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ParseProjectIdError {
+    /// Raised if the value is not an integer in the supported range.
+    #[error("invalid value for project id")]
+    InvalidValue,
+    /// Raised if an empty value is parsed.
+    #[error("empty or missing project id")]
+    EmptyValue,
+}
+
+/// The unique identifier of a Sentry project.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct ProjectId(u64);
+
+impl ProjectId {
+    /// Creates a new project ID from its numeric value.
+    #[inline]
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// Returns the numeric value of this project ID.
+    #[inline]
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ProjectId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.value())
+    }
+}
+
+impl FromStr for ProjectId {
+    type Err = ParseProjectIdError;
+
+    fn from_str(s: &str) -> Result<ProjectId, ParseProjectIdError> {
+        if s.is_empty() {
+            return Err(ParseProjectIdError::EmptyValue);
+        }
+
+        match s.parse::<u64>() {
+            Ok(val) => Ok(ProjectId::new(val)),
+            Err(_) => Err(ParseProjectIdError::InvalidValue),
+        }
+    }
+}
 
 /// An error parsing [`ProjectKey`].
 #[derive(Clone, Copy, Debug)]
@@ -41,6 +93,11 @@ impl ProjectKey {
         let mut iter = key.split('.');
         let key = ProjectKey::parse(iter.next().ok_or(ParseProjectKeyError)?)?;
         Ok((key, iter.collect()))
+    }
+
+    /// Returns the bytes of the project key.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 
     /// Returns the string representation of the project key.

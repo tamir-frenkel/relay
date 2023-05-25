@@ -1,13 +1,12 @@
-use failure::{err_msg, Error};
-
+use anyhow::Result;
 use relay_config::{Config, RelayMode};
 
-pub fn check_config(config: &Config) -> Result<(), Error> {
+pub fn check_config(config: &Config) -> Result<()> {
     if config.relay_mode() == RelayMode::Managed && config.credentials().is_none() {
-        return Err(err_msg(
+        anyhow::bail!(
             "relay has no credentials, which are required in managed mode. \
              Generate some with \"relay credentials generate\" first.",
-        ));
+        );
     }
 
     Ok(())
@@ -39,17 +38,17 @@ pub fn dump_spawn_infos(config: &Config) {
 /// Dumps out credential info.
 pub fn dump_credentials(config: &Config) {
     match config.relay_id() {
-        Some(id) => println!("  relay id: {}", id),
+        Some(id) => println!("  relay id: {id}"),
         None => println!("  relay id: -"),
     };
     match config.public_key() {
-        Some(key) => println!("  public key: {}", key),
+        Some(key) => println!("  public key: {key}"),
         None => println!("  public key: -"),
     };
 }
 
 /// Initialize the metric system.
-pub fn init_metrics(config: &Config) -> Result<(), Error> {
+pub fn init_metrics(config: &Config) -> Result<()> {
     let addrs = config.statsd_addrs()?;
     if addrs.is_empty() {
         return Ok(());

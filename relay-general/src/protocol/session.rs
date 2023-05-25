@@ -1,15 +1,16 @@
+use std::fmt::{self, Display};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use failure::Fail;
+use relay_common::Uuid;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
+use crate::macros::derive_fromstr_and_display;
+use crate::protocol::utils::null_to_default;
 use crate::protocol::IpAddr;
 
 /// The type of session event we're dealing with.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SessionStatus {
     /// The session is healthy.
     ///
@@ -23,6 +24,8 @@ pub enum SessionStatus {
     Abnormal,
     /// The session exited cleanly but experienced some errors during its run.
     Errored,
+    /// Unknown status, for forward compatibility.
+    Unknown(String),
 }
 
 impl SessionStatus {
@@ -40,6 +43,39 @@ impl SessionStatus {
     pub fn is_fatal(&self) -> bool {
         matches!(self, SessionStatus::Crashed | SessionStatus::Abnormal)
     }
+    fn as_str(&self) -> &str {
+        match self {
+            SessionStatus::Ok => "ok",
+            SessionStatus::Crashed => "crashed",
+            SessionStatus::Abnormal => "abnormal",
+            SessionStatus::Exited => "exited",
+            SessionStatus::Errored => "errored",
+            SessionStatus::Unknown(s) => s.as_str(),
+        }
+    }
+}
+
+impl Display for SessionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+relay_common::impl_str_serde!(SessionStatus, "A session status");
+
+impl std::str::FromStr for SessionStatus {
+    type Err = ParseSessionStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "ok" => SessionStatus::Ok,
+            "crashed" => SessionStatus::Crashed,
+            "abnormal" => SessionStatus::Abnormal,
+            "exited" => SessionStatus::Exited,
+            "errored" => SessionStatus::Errored,
+            other => SessionStatus::Unknown(other.to_owned()),
+        })
+    }
 }
 
 impl Default for SessionStatus {
@@ -49,17 +85,47 @@ impl Default for SessionStatus {
 }
 
 /// An error used when parsing `SessionStatus`.
-#[derive(Debug, Fail)]
-#[fail(display = "invalid session status")]
+#[derive(Debug)]
 pub struct ParseSessionStatusError;
 
-derive_fromstr_and_display!(SessionStatus, ParseSessionStatusError, {
-    SessionStatus::Ok => "ok",
-    SessionStatus::Crashed => "crashed",
-    SessionStatus::Abnormal => "abnormal",
-    SessionStatus::Exited => "exited",
-    SessionStatus::Errored => "errored",
+impl fmt::Display for ParseSessionStatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid session status")
+    }
+}
+
+impl std::error::Error for ParseSessionStatusError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AbnormalMechanism {
+    AnrForeground,
+    AnrBackground,
+    #[serde(other)]
+    #[default]
+    None,
+}
+
+#[derive(Debug)]
+pub struct ParseAbnormalMechanismError;
+
+impl fmt::Display for ParseAbnormalMechanismError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid abnormal mechanism")
+    }
+}
+
+derive_fromstr_and_display!(AbnormalMechanism, ParseAbnormalMechanismError, {
+    AbnormalMechanism::AnrForeground => "anr_foreground",
+    AbnormalMechanism::AnrBackground => "anr_background",
+    AbnormalMechanism::None => "none",
 });
+
+impl AbnormalMechanism {
+    fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+}
 
 /// Additional attributes for Sessions.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -109,7 +175,7 @@ pub trait SessionLike {
     fn abnormal_count(&self) -> u32;
     fn crashed_count(&self) -> u32;
     fn all_errors(&self) -> Option<SessionErrored>;
-    fn final_duration(&self) -> Option<(f64, SessionStatus)>;
+    fn abnormal_mechanism(&self) -> AbnormalMechanism;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -143,6 +209,13 @@ pub struct SessionUpdate {
     /// The session event attributes.
     #[serde(rename = "attrs")]
     pub attributes: SessionAttributes,
+    /// The abnormal mechanism.
+    #[serde(
+        default,
+        deserialize_with = "null_to_default",
+        skip_serializing_if = "AbnormalMechanism::is_none"
+    )]
+    pub abnormal_mechanism: AbnormalMechanism,
 }
 
 impl SessionUpdate {
@@ -167,11 +240,7 @@ impl SessionLike for SessionUpdate {
     }
 
     fn total_count(&self) -> u32 {
-        if self.init {
-            1
-        } else {
-            0
-        }
+        u32::from(self.init)
     }
 
     fn abnormal_count(&self) -> u32 {
@@ -188,21 +257,16 @@ impl SessionLike for SessionUpdate {
         }
     }
 
-    fn final_duration(&self) -> Option<(f64, SessionStatus)> {
-        if self.status.is_terminal() {
-            if let Some(duration) = self.duration {
-                return Some((duration, self.status));
-            }
-        }
-        None
-    }
-
     fn all_errors(&self) -> Option<SessionErrored> {
         if self.errors > 0 || self.status.is_error() {
             Some(SessionErrored::Individual(self.session_id))
         } else {
             None
         }
+    }
+
+    fn abnormal_mechanism(&self) -> AbnormalMechanism {
+        self.abnormal_mechanism
     }
 }
 
@@ -253,10 +317,6 @@ impl SessionLike for SessionAggregateItem {
         self.crashed
     }
 
-    fn final_duration(&self) -> Option<(f64, SessionStatus)> {
-        None
-    }
-
     fn all_errors(&self) -> Option<SessionErrored> {
         // Errors contain crashed & abnormal as well.
         // See https://github.com/getsentry/snuba/blob/c45f2a8636f9ea3dfada4e2d0ae5efef6c6248de/snuba/migrations/snuba_migrations/sessions/0003_sessions_matview.py#L80-L81
@@ -266,6 +326,9 @@ impl SessionLike for SessionAggregateItem {
         } else {
             None
         }
+    }
+    fn abnormal_mechanism(&self) -> AbnormalMechanism {
+        AbnormalMechanism::None
     }
 }
 
@@ -293,7 +356,22 @@ impl SessionAggregates {
 
 #[cfg(test)]
 mod tests {
+
+    use std::str::FromStr;
+
+    use similar_asserts::assert_eq;
+
     use super::*;
+
+    #[test]
+    fn test_sessionstatus_unknown() {
+        let unknown = SessionStatus::from_str("invalid status").unwrap();
+        if let SessionStatus::Unknown(inner) = unknown {
+            assert_eq!(inner, "invalid status".to_owned());
+        } else {
+            panic!();
+        }
+    }
 
     #[test]
     fn test_session_default_values() {
@@ -328,6 +406,7 @@ mod tests {
             duration: None,
             init: false,
             status: SessionStatus::Ok,
+            abnormal_mechanism: AbnormalMechanism::None,
             errors: 0,
             attributes: SessionAttributes {
                 release: "sentry-test@1.0.0".to_owned(),
@@ -343,8 +422,8 @@ mod tests {
         assert!((default_sequence() - parsed.sequence) <= 1);
         parsed.sequence = 4711;
 
-        assert_eq_dbg!(update, parsed);
-        assert_eq_str!(output, serde_json::to_string_pretty(&update).unwrap());
+        assert_eq!(update, parsed);
+        assert_eq!(output, serde_json::to_string_pretty(&update).unwrap());
     }
 
     #[test]
@@ -388,6 +467,7 @@ mod tests {
             started: "2020-02-07T14:16:00Z".parse().unwrap(),
             duration: Some(1947.49),
             status: SessionStatus::Exited,
+            abnormal_mechanism: AbnormalMechanism::None,
             errors: 0,
             init: true,
             attributes: SessionAttributes {
@@ -398,8 +478,8 @@ mod tests {
             },
         };
 
-        assert_eq_dbg!(update, SessionUpdate::parse(json.as_bytes()).unwrap());
-        assert_eq_str!(json, serde_json::to_string_pretty(&update).unwrap());
+        assert_eq!(update, SessionUpdate::parse(json.as_bytes()).unwrap());
+        assert_eq!(json, serde_json::to_string_pretty(&update).unwrap());
     }
 
     #[test]
@@ -413,6 +493,56 @@ mod tests {
 }"#;
 
         let update = SessionUpdate::parse(json.as_bytes()).unwrap();
-        assert_eq_dbg!(update.attributes.ip_address, Some(IpAddr::auto()));
+        assert_eq!(update.attributes.ip_address, Some(IpAddr::auto()));
+    }
+    #[test]
+    fn test_session_abnormal_mechanism() {
+        let json = r#"{
+    "sid": "8333339f-5675-4f89-a9a0-1c935255ab58",
+    "started": "2020-02-07T14:16:00Z",
+    "status": "abnormal",
+    "abnormal_mechanism": "anr_background",
+    "attrs": {
+    "release": "sentry-test@1.0.0",
+    "environment": "production"
+    }
+    }"#;
+
+        let update = SessionUpdate::parse(json.as_bytes()).unwrap();
+        assert_eq!(update.abnormal_mechanism, AbnormalMechanism::AnrBackground);
+    }
+
+    #[test]
+    fn test_session_invalid_abnormal_mechanism() {
+        let json = r#"{
+  "sid": "8333339f-5675-4f89-a9a0-1c935255ab58",
+  "started": "2020-02-07T14:16:00Z",
+  "status": "abnormal",
+  "abnormal_mechanism": "invalid_mechanism",
+  "attrs": {
+    "release": "sentry-test@1.0.0",
+    "environment": "production"
+  }
+}"#;
+
+        let update = SessionUpdate::parse(json.as_bytes()).unwrap();
+        assert_eq!(update.abnormal_mechanism, AbnormalMechanism::None);
+    }
+
+    #[test]
+    fn test_session_null_abnormal_mechanism() {
+        let json = r#"{
+  "sid": "8333339f-5675-4f89-a9a0-1c935255ab58",
+  "started": "2020-02-07T14:16:00Z",
+  "status": "abnormal",
+  "abnormal_mechanism": null,
+  "attrs": {
+    "release": "sentry-test@1.0.0",
+    "environment": "production"
+  }
+}"#;
+
+        let update = SessionUpdate::parse(json.as_bytes()).unwrap();
+        assert_eq!(update.abnormal_mechanism, AbnormalMechanism::None);
     }
 }

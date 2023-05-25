@@ -8,7 +8,7 @@ session = requests.session()
 
 
 class SentryLike(object):
-    _healthcheck_passed = False
+    _health_check_passed = False
 
     default_dsn_public_key = "31a5a894b4524f74a9a8d0e27e21ba91"
 
@@ -42,7 +42,7 @@ class SentryLike(object):
     def get_dsn_public_key(self, project_id, idx=0):
         """
         Returns a dsn key for a project.
-        By default it returns the first configured dsn key, if idx is specified
+        By default, it returns the first configured dsn key, if idx is specified
         it tries to return the key at the specified index.
         If the index is beyond the number of  available dsn_keys for the project it raises
 
@@ -95,12 +95,12 @@ class SentryLike(object):
                     raise
                 backoff *= 2
 
-    def wait_relay_healthcheck(self):
-        if self._healthcheck_passed:
+    def wait_relay_health_check(self):
+        if self._health_check_passed:
             return
 
         self._wait("/api/relay/healthcheck/ready/")
-        self._healthcheck_passed = True
+        self._health_check_passed = True
 
     def __repr__(self):
         return "<{}({})>".format(self.__class__.__name__, repr(self.upstream))
@@ -166,7 +166,6 @@ class SentryLike(object):
             "X-Sentry-Auth": self.get_auth_header(project_id, dsn_key_idx),
             **(headers or {}),
         }
-
         response = self.post(url, headers=headers, data=envelope.serialize())
         response.raise_for_status()
 
@@ -178,7 +177,13 @@ class SentryLike(object):
             item.headers = {**item.headers, **item_headers}
         self.send_envelope(project_id, envelope)
 
-    def send_transaction(self, project_id, payload, item_headers=None):
+    def send_transaction(
+        self,
+        project_id,
+        payload,
+        item_headers=None,
+        trace_info=None,
+    ):
         envelope = Envelope()
         envelope.add_transaction(payload)
         if item_headers:
@@ -188,11 +193,21 @@ class SentryLike(object):
         if envelope.headers is None:
             envelope.headers = {}
 
-        trace_info = {
-            "trace_id": payload["contexts"]["trace"]["trace_id"],
-            "public_key": self.get_dsn_public_key(project_id),
-        }
+        if trace_info is None:
+            trace_info = {
+                "trace_id": payload["contexts"]["trace"]["trace_id"],
+                "public_key": self.get_dsn_public_key(project_id),
+            }
+
         envelope.headers["trace"] = trace_info
+
+        self.send_envelope(project_id, envelope)
+
+    def send_replay_event(self, project_id, payload, item_headers=None):
+        envelope = Envelope()
+        envelope.add_item(Item(payload=PayloadRef(json=payload), type="replay_event"))
+        if envelope.headers is None:
+            envelope.headers = {}
 
         self.send_envelope(project_id, envelope)
 
@@ -212,6 +227,17 @@ class SentryLike(object):
             Item(
                 payload=PayloadRef(bytes=payload.encode()),
                 type="metrics",
+                headers=None if timestamp is None else {"timestamp": timestamp},
+            )
+        )
+        self.send_envelope(project_id, envelope)
+
+    def send_metrics_buckets(self, project_id, payload, timestamp=None):
+        envelope = Envelope()
+        envelope.add_item(
+            Item(
+                payload=PayloadRef(json=payload),
+                type="metric_buckets",
                 headers=None if timestamp is None else {"timestamp": timestamp},
             )
         )
@@ -323,6 +349,11 @@ class SentryLike(object):
         )
         response.raise_for_status()
         return response
+
+    def send_check_in(self, project_id, check_in):
+        envelope = Envelope()
+        envelope.add_item(Item(payload=PayloadRef(json=check_in), type="check_in"))
+        self.send_envelope(project_id, envelope)
 
     def request(self, method, path, timeout=None, **kwargs):
         assert path.startswith("/")

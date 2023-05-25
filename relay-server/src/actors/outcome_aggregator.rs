@@ -5,16 +5,16 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use actix::{Actor, AsyncContext, Context, Handler, Recipient, Supervised, SystemService};
-
+use chrono::Utc;
 use relay_common::{DataCategory, UnixTimestamp};
 use relay_config::{Config, EmitOutcomes};
 use relay_quotas::Scoping;
 use relay_statsd::metric;
-use relay_system::{Controller, Shutdown};
+use relay_system::{Addr, Controller, Service, Shutdown};
 
-use crate::actors::outcome::{DiscardReason, Outcome, OutcomeError, TrackOutcome};
+use crate::actors::outcome::{DiscardReason, Outcome, OutcomeProducer, TrackOutcome};
 use crate::statsd::RelayTimers;
+use crate::utils::SleepHandle;
 
 /// Contains everything to construct a `TrackOutcome`, except quantity
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -41,8 +41,9 @@ enum AggregationMode {
     Lossy,
 }
 
-/// Aggregates outcomes into buckets, and flushes them periodically.
-/// Inspired by [`relay_metrics::Aggregator`].
+/// Aggregates [`Outcome`]s into buckets and flushes them periodically.
+///
+/// This service handles a single message [`TrackOutcome`].
 pub struct OutcomeAggregator {
     mode: AggregationMode,
     /// The width of each aggregated bucket in seconds
@@ -52,11 +53,13 @@ pub struct OutcomeAggregator {
     /// Mapping from bucket key to quantity.
     buckets: HashMap<BucketKey, u32>,
     /// The recipient of the aggregated outcomes
-    outcome_producer: Recipient<TrackOutcome>,
+    outcome_producer: Addr<OutcomeProducer>,
+    /// An optional timeout to the next scheduled flush.
+    flush_handle: SleepHandle,
 }
 
 impl OutcomeAggregator {
-    pub fn new(config: &Config, outcome_producer: Recipient<TrackOutcome>) -> Self {
+    pub fn new(config: &Config, outcome_producer: Addr<OutcomeProducer>) -> Self {
         let mode = match config.emit_outcomes() {
             EmitOutcomes::AsOutcomes => AggregationMode::Lossless,
             EmitOutcomes::AsClientReports => AggregationMode::Lossy,
@@ -69,104 +72,22 @@ impl OutcomeAggregator {
             flush_interval: config.outcome_aggregator().flush_interval,
             buckets: HashMap::new(),
             outcome_producer,
+            flush_handle: SleepHandle::idle(),
         }
     }
 
-    fn do_flush(&mut self) {
-        let bucket_interval = self.bucket_interval;
-        let outcome_producer = self.outcome_producer.clone();
-
-        for (bucket_key, quantity) in self.buckets.drain() {
-            let BucketKey {
-                offset,
-                scoping,
-                outcome,
-                remote_addr,
-                category,
-            } = bucket_key;
-
-            let timestamp = UnixTimestamp::from_secs(offset * bucket_interval);
-            let outcome = TrackOutcome {
-                timestamp: timestamp.as_datetime(),
-                scoping,
-                outcome,
-                event_id: None,
-                remote_addr,
-                category,
-                quantity,
-            };
-
-            relay_log::trace!("Flushing outcome for timestamp {}", timestamp);
-            outcome_producer.do_send(outcome).ok();
-        }
-    }
-
-    /// Return true if event_id and remote_addr should be erased
-    fn erase_high_cardinality_fields(&self, msg: &TrackOutcome) -> bool {
-        // In lossy mode, always erase
-        matches!(self.mode, AggregationMode::Lossy)
-            || matches!(
-                // Always erase high-cardinality fields for specific outcomes:
-                msg.outcome,
-                Outcome::RateLimited(_)
-                    | Outcome::Invalid(DiscardReason::ProjectId)
-                    | Outcome::FilteredSampling(_)
-            )
-    }
-
-    fn flush(&mut self, _context: &mut <Self as Actor>::Context) {
-        metric!(timer(RelayTimers::OutcomeAggregatorFlushTime), {
-            self.do_flush();
-        });
-    }
-}
-
-impl Actor for OutcomeAggregator {
-    type Context = Context<Self>;
-
-    fn started(&mut self, ctx: &mut Self::Context) {
-        relay_log::info!("outcome aggregator started");
-        Controller::subscribe(ctx.address());
-        if self.mode != AggregationMode::DropEverything && self.flush_interval > 0 {
-            ctx.run_interval(Duration::from_secs(self.flush_interval), Self::flush);
-        }
-    }
-
-    fn stopped(&mut self, _ctx: &mut Self::Context) {
-        relay_log::info!("outcome aggregator stopped");
-    }
-}
-
-impl Supervised for OutcomeAggregator {}
-
-impl SystemService for OutcomeAggregator {}
-
-impl Handler<Shutdown> for OutcomeAggregator {
-    type Result = Result<(), ()>;
-
-    fn handle(&mut self, message: Shutdown, context: &mut Self::Context) -> Self::Result {
+    fn handle_shutdown(&mut self, message: Shutdown) {
         if message.timeout.is_some() {
-            // Flush everything on graceful shutdown
-            self.flush(context);
+            self.flush();
+            relay_log::info!("outcome aggregator stopped");
         }
-        Ok(())
     }
-}
 
-impl Default for OutcomeAggregator {
-    fn default() -> Self {
-        unimplemented!("register with the SystemRegistry instead")
-    }
-}
-
-impl Handler<TrackOutcome> for OutcomeAggregator {
-    type Result = Result<(), OutcomeError>;
-
-    fn handle(&mut self, msg: TrackOutcome, _ctx: &mut Self::Context) -> Self::Result {
+    fn handle_track_outcome(&mut self, msg: TrackOutcome) {
         relay_log::trace!("Outcome aggregation requested: {:?}", msg);
 
         if self.mode == AggregationMode::DropEverything {
-            return Ok(());
+            return;
         }
 
         let (event_id, remote_addr) = if self.erase_high_cardinality_fields(&msg) {
@@ -178,8 +99,8 @@ impl Handler<TrackOutcome> for OutcomeAggregator {
 
         if let Some(event_id) = event_id {
             relay_log::trace!("Forwarding outcome without aggregation: {}", event_id);
-            self.outcome_producer.do_send(msg).ok();
-            return Ok(());
+            self.outcome_producer.send(msg);
+            return;
         }
 
         let offset = msg.timestamp.timestamp() as u64 / self.bucket_interval;
@@ -198,8 +119,89 @@ impl Handler<TrackOutcome> for OutcomeAggregator {
         if self.flush_interval == 0 {
             // Flush immediately. This is useful for integration tests.
             self.do_flush();
+        } else if self.flush_handle.is_idle() {
+            self.flush_handle
+                .set(Duration::from_secs(self.flush_interval));
         }
+    }
 
-        Ok(())
+    fn do_flush(&mut self) {
+        self.flush_handle.reset();
+
+        let bucket_interval = self.bucket_interval;
+        let outcome_producer = self.outcome_producer.clone();
+
+        for (bucket_key, quantity) in self.buckets.drain() {
+            let BucketKey {
+                offset,
+                scoping,
+                outcome,
+                remote_addr,
+                category,
+            } = bucket_key;
+
+            // In case the timestamp cannot be extracted, we fallback to the current UTC `DateTime`
+            let timestamp = UnixTimestamp::from_secs(offset * bucket_interval)
+                .as_datetime()
+                .unwrap_or_else(Utc::now);
+
+            let outcome = TrackOutcome {
+                timestamp,
+                scoping,
+                outcome,
+                event_id: None,
+                remote_addr,
+                category,
+                quantity,
+            };
+
+            relay_log::trace!("Flushing outcome for timestamp {}", timestamp);
+            outcome_producer.send(outcome);
+        }
+    }
+
+    /// Return true if event_id and remote_addr should be erased
+    fn erase_high_cardinality_fields(&self, msg: &TrackOutcome) -> bool {
+        // In lossy mode, always erase
+        matches!(self.mode, AggregationMode::Lossy)
+            || matches!(
+                // Always erase high-cardinality fields for specific outcomes:
+                msg.outcome,
+                Outcome::RateLimited(_)
+                    | Outcome::Invalid(DiscardReason::ProjectId)
+                    | Outcome::FilteredSampling(_)
+            )
+    }
+
+    fn flush(&mut self) {
+        metric!(timer(RelayTimers::OutcomeAggregatorFlushTime), {
+            self.do_flush();
+        });
+    }
+}
+
+impl Service for OutcomeAggregator {
+    type Interface = TrackOutcome;
+
+    fn spawn_handler(mut self, mut rx: relay_system::Receiver<Self::Interface>) {
+        tokio::spawn(async move {
+            let mut shutdown = Controller::shutdown_handle();
+            relay_log::info!("outcome aggregator started");
+
+            loop {
+                tokio::select! {
+                    // Prioritize flush over receiving messages to prevent starving. Shutdown can be
+                    // last since it is not vital if there are still messages in the channel.
+                    biased;
+
+                    () = &mut self.flush_handle => self.flush(),
+                    Some(message) = rx.recv() => self.handle_track_outcome(message),
+                    shutdown = shutdown.notified() => self.handle_shutdown(shutdown),
+                    else => break,
+                }
+            }
+
+            relay_log::info!("outcome aggregator stopped");
+        });
     }
 }

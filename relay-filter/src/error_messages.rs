@@ -32,7 +32,7 @@ pub fn matches(event: &Event, patterns: &GlobPatterns) -> bool {
                     let message = match (ty, value) {
                         ("", value) => Cow::Borrowed(value),
                         (ty, "") => Cow::Borrowed(ty),
-                        (ty, value) => Cow::Owned(format!("{}: {}", ty, value)),
+                        (ty, value) => Cow::Owned(format!("{ty}: {value}")),
                     };
                     if patterns.is_match(message.as_ref()) {
                         return true;
@@ -58,11 +58,10 @@ pub fn should_filter(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use relay_general::protocol::{Exception, LogEntry, Values};
     use relay_general::types::Annotated;
 
+    use super::*;
     use crate::GlobPatterns;
 
     #[test]
@@ -148,8 +147,8 @@ mod tests {
                 println!(
                     "------------------------------------------------------------------------"
                 );
-                println!("Config: {:?}", config);
-                println!("Case: {:?}", case);
+                println!("Config: {config:?}");
+                println!("Case: {case:?}");
 
                 let (exc_type, exc_value, logentry_formatted, should_ingest) = case;
                 let event = Event {
@@ -175,5 +174,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_filter_hydration_error() {
+        let pattern =
+            "*https://reactjs.org/docs/error-decoder.html?invariant={418,419,422,423,425}*";
+        let config = ErrorMessagesFilterConfig {
+            patterns: GlobPatterns::new(vec![pattern.to_string()]),
+        };
+
+        let event = Annotated::<Event>::from_json(
+            r#"{
+                "exception": {
+                    "values": [
+                        {
+                            "type": "Error",
+                            "value": "Minified React error #423; visit https://reactjs.org/docs/error-decoder.html?invariant=423 for the full message or use the non-minified dev environment for full errors and additional helpful warnings."
+                        }
+                    ]
+                }
+            }"#,
+        ).unwrap();
+
+        assert!(should_filter(&event.0.unwrap(), &config) == Err(FilterStatKey::ErrorMessage));
     }
 }

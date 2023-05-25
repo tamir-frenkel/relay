@@ -1,5 +1,17 @@
 {
   "type": "csp",
+  "contexts": {
+    "browser": {
+      "name": "Chrome",
+      "type": "browser",
+      "version": "74.0.3729"
+    },
+    "client_os": {
+      "name": "Windows",
+      "type": "os",
+      "version": ">=10"
+    }
+  },
   "csp": {
     "blocked_uri": "http://evilhackerscripts.com",
     "document_uri": "https://example.com/foo/bar",
@@ -13,12 +25,17 @@
   "logentry": {
     "formatted": "Blocked 'default-src' from 'evilhackerscripts.com'"
   },
+  "logger": "csp",
   "release": "01d5c3165d9fbc5c8bdcf9550a1d6793a80fc02b",
   "request": {
     "headers": [
       [
         "Referer",
         "https://www.google.com/"
+      ],
+      [
+        "User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.169 Safari/537.36"
       ]
     ],
     "url": "https://example.com/foo/bar"
@@ -32,5 +49,8 @@
       "blocked-uri",
       "http://evilhackerscripts.com"
     ]
-  ]
+  ],
+  "user": {
+    "ip_address": "127.0.0.1"
+  }
 }

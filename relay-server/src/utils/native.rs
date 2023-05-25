@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 
 use chrono::{TimeZone, Utc};
 use minidump::{MinidumpAnnotation, MinidumpCrashpadInfo, MinidumpModuleList, Module};
-
 use relay_general::protocol::{
     Context, ContextInner, Contexts, Event, Exception, JsonLenientString, Level, Mechanism, Values,
 };
@@ -200,8 +199,13 @@ pub fn process_minidump(event: &mut Event, data: &[u8]) {
 
     // Use the minidump's timestamp as the event's primary time. This timestamp can lie multiple
     // days in the past, in which case the event may be rejected in store normalization.
-    let timestamp = Utc.timestamp(minidump.header.time_date_stamp.into(), 0);
-    event.timestamp.set_value(Some(timestamp.into()));
+    let timestamp = Utc
+        .timestamp_opt(minidump.header.time_date_stamp.into(), 0)
+        .latest();
+
+    if let Some(timestamp) = timestamp {
+        event.timestamp.set_value(Some(timestamp.into()));
+    }
 
     // Write annotations from the crashpad info stream, but skip gracefully on error. Annotations
     // are non-essential to processing.

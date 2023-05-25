@@ -29,14 +29,15 @@ impl Default for ReplaceRedaction {
 }
 
 /// Defines how replacements happen.
-#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Default)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Redaction {
     /// The default redaction for this operation (normally equivalent to `Remove`).
     ///
     /// The main difference to `Remove` is that if the redaction is explicitly
     /// set to `Remove` it also applies in situations where a default
-    /// redaction is therwise not passed down (for instance with `Multiple`).
+    /// redaction is otherwise not passed down (for instance with `Multiple`).
+    #[default]
     Default,
     /// Removes the value and puts nothing in its place.
     Remove,
@@ -46,10 +47,32 @@ pub enum Redaction {
     Mask,
     /// Replaces the value with a hash
     Hash,
+    /// Added for forward compatibility as catch-all variant.
+    #[serde(other, skip_serializing)]
+    Other,
 }
 
-impl Default for Redaction {
-    fn default() -> Redaction {
-        Redaction::Default
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn test_redaction_deser_method() {
+        let json = r#"{"method": "replace", "text": "[filter]"}"#;
+
+        let deser: Redaction = serde_json::from_str(json).unwrap();
+        let redaction = Redaction::Replace(ReplaceRedaction {
+            text: "[filter]".to_string(),
+        });
+        assert!(deser == redaction);
+    }
+
+    #[test]
+    fn test_redaction_deser_other() {
+        let json = r#"{"method": "foo", "text": "[filter]"}"#;
+
+        let deser: Redaction = serde_json::from_str(json).unwrap();
+        assert!(matches!(deser, Redaction::Other));
     }
 }
