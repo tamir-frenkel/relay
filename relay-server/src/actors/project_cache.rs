@@ -793,7 +793,7 @@ impl ProjectCacheBroker {
     }
 
     fn handle_message(&mut self, message: ProjectCache) {
-        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::ProjectState);
+        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::ProjectCache);
         match message {
             ProjectCache::RequestUpdate(message) => self.handle_request_update(message),
             ProjectCache::Get(message, sender) => self.handle_get(message, sender),

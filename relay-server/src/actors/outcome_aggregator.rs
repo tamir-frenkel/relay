@@ -9,6 +9,7 @@ use chrono::Utc;
 use relay_common::{DataCategory, UnixTimestamp};
 use relay_config::{Config, EmitOutcomes};
 use relay_quotas::Scoping;
+use relay_statsd::alloc::RelayMemoryUseCase;
 use relay_statsd::metric;
 use relay_system::{Addr, Controller, Service, Shutdown};
 

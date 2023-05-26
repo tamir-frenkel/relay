@@ -384,7 +384,6 @@ impl EnvelopeManagerService {
     }
 
     async fn handle_message(&self, message: EnvelopeManager) {
-        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::ManageEnvelope);
         match message {
             EnvelopeManager::SubmitEnvelope(message) => {
                 self.handle_submit(*message).await;
