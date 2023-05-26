@@ -6,6 +6,7 @@ on:
       - master
       - release/**
       - release-library/**
+      - wip/memoria
 
   pull_request:
 
