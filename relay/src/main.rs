@@ -110,8 +110,11 @@ mod utils;
 use std::process;
 
 use relay_log::Hub;
+use relay_statsd::alloc::launch_statsd_memory_thread;
 
 pub fn main() {
+    launch_statsd_memory_thread(&relay_server::alloc::ALLOCATOR);
+
     let exit_code = match cli::execute() {
         Ok(()) => 0,
         Err(err) => {
