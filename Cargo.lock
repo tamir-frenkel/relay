@@ -2978,7 +2978,6 @@ dependencies = [
  "relay-log",
  "relay-server",
  "relay-statsd",
- "tikv-jemallocator",
 ]
 
 [[package]]
@@ -3367,6 +3366,7 @@ dependencies = [
  "symbolic-unreal",
  "tempfile",
  "thiserror",
+ "tikv-jemallocator",
  "tokio",
  "tower",
  "tower-http",
