@@ -19,7 +19,7 @@ impl CounterMetric for AllocCounters {
     fn name(&self) -> &'static str {
         match *self {
             AllocCounters::Alloc => "alloc",
-            AllocCounters::Error => "error",
+            AllocCounters::Error => "alloc.error",
         }
     }
 }
