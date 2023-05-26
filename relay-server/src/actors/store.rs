@@ -106,6 +106,7 @@ impl StoreService {
     }
 
     fn handle_message(&self, message: Store) {
+        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::StoreEnvelope);
         let Store(message, sender) = message;
         sender.send(self.handle_store_envelope(message));
     }

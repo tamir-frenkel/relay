@@ -638,6 +638,7 @@ impl ClientReportOutcomeProducer {
     }
 
     fn handle_message(&mut self, msg: TrackOutcome) {
+        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::TrackOutcome);
         let mut client_report = ClientReport {
             timestamp: Some(UnixTimestamp::from_secs(
                 msg.timestamp.timestamp().try_into().unwrap_or(0),

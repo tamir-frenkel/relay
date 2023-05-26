@@ -526,7 +526,6 @@ impl ProjectCacheBroker {
     /// a project that has expired recently and for which a fetch is already underway in
     /// [`super::project_upstream`].
     fn evict_stale_project_caches(&mut self) {
-        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::ProjectState);
         let eviction_start = Instant::now();
         let delta = 2 * self.config.project_cache_expiry() + self.config.project_grace_period();
 
@@ -555,7 +554,7 @@ impl ProjectCacheBroker {
 
     fn get_or_create_project(&mut self, project_key: ProjectKey) -> &mut Project {
         metric!(histogram(RelayHistograms::ProjectStateCacheSize) = self.projects.len() as u64);
-        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::ProjectState);
+        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::ProjectCache);
 
         let config = self.config.clone();
 
@@ -794,6 +793,7 @@ impl ProjectCacheBroker {
     }
 
     fn handle_message(&mut self, message: ProjectCache) {
+        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::ProjectState);
         match message {
             ProjectCache::RequestUpdate(message) => self.handle_request_update(message),
             ProjectCache::Get(message, sender) => self.handle_get(message, sender),

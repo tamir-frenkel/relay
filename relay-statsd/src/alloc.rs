@@ -30,7 +30,11 @@ pub enum RelayMemoryUseCase {
     #[default]
     None,
     ProcessEnvelope,
-    ProjectState,
+    ProjectCache,
+    StoreEnvelope,
+    TrackOutcome,
+    TrackOutcomeAggregator,
+    ManageEnvelope,
 }
 
 impl UseCase for RelayMemoryUseCase {}

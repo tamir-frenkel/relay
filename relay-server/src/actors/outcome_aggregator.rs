@@ -184,6 +184,8 @@ impl Service for OutcomeAggregator {
     type Interface = TrackOutcome;
 
     fn spawn_handler(mut self, mut rx: relay_system::Receiver<Self::Interface>) {
+        let _guard =
+            crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::TrackOutcomeAggregator);
         tokio::spawn(async move {
             let mut shutdown = Controller::shutdown_handle();
             relay_log::info!("outcome aggregator started");
