@@ -6,6 +6,7 @@ use std::sync::Arc;
 use relay_common::{ProjectId, ProjectKey};
 use relay_config::Config;
 use relay_log::LogError;
+use relay_statsd::alloc::RelayMemoryUseCase;
 use relay_system::{AsyncResponse, FromMessage, Interface, Receiver, Sender, Service};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -45,6 +46,7 @@ impl LocalProjectSourceService {
     }
 
     fn handle_message(&mut self, message: LocalProjectSource) {
+        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::ProjectCache);
         let LocalProjectSource(message, sender) = message;
         let states = self.local_states.get(&message.project_key()).cloned();
         sender.send(states);

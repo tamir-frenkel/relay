@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use relay_auth::{PublicKey, RelayId};
 use relay_config::{Config, RelayInfo};
 use relay_log::LogError;
+use relay_statsd::alloc::RelayMemoryUseCase;
 use relay_system::{
     Addr, BroadcastChannel, BroadcastResponse, BroadcastSender, FromMessage, Interface, Service,
 };
@@ -297,6 +298,7 @@ impl RelayCacheService {
     /// Sends information immediately if it is available in the cache. Otherwise, this schedules a
     /// delayed background fetch and attaches the sender to a broadcast channel.
     fn get_or_fetch(&mut self, message: GetRelay, sender: BroadcastSender<GetRelayResult>) {
+        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::GetRelay);
         let relay_id = message.relay_id;
 
         // First check the statically configured relays

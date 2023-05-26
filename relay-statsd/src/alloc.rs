@@ -35,6 +35,7 @@ pub enum RelayMemoryUseCase {
     TrackOutcome,
     TrackOutcomeAggregator,
     ManageEnvelope,
+    GetRelay,
 }
 
 impl UseCase for RelayMemoryUseCase {}
