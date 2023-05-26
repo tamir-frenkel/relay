@@ -2398,8 +2398,6 @@ impl EnvelopeProcessorService {
     }
 
     fn process_state(&self, state: &mut ProcessEnvelopeState) -> Result<(), ProcessingError> {
-        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::StoreNormalizer);
-
         macro_rules! if_processing {
             ($if_true:block) => {
                 #[cfg(feature = "processing")] {
@@ -2472,6 +2470,7 @@ impl EnvelopeProcessorService {
         &self,
         message: ProcessEnvelope,
     ) -> Result<ProcessEnvelopeResponse, ProcessingError> {
+        let _guard = crate::alloc::ALLOCATOR.with_usecase(RelayMemoryUseCase::ProcessEnvelope);
         let mut state = self.prepare_state(message)?;
         let project_id = state.project_id;
         let client = state.envelope().meta().client().map(str::to_owned);

@@ -29,21 +29,11 @@ impl CounterMetric for AllocCounters {
 pub enum RelayMemoryUseCase {
     #[default]
     None,
-    StoreNormalizer,
+    ProcessEnvelope,
     ProjectState,
 }
 
 impl UseCase for RelayMemoryUseCase {}
-
-impl RelayMemoryUseCase {
-    fn as_str(&self) -> &'static str {
-        match self {
-            RelayMemoryUseCase::None => "none",
-            RelayMemoryUseCase::StoreNormalizer => "store_normalizer",
-            RelayMemoryUseCase::ProjectState => "project_state",
-        }
-    }
-}
 
 pub type Allocator<A> = Alloc<RelayMemoryUseCase, StatsRecorder<RelayMemoryUseCase>, A>;
 
@@ -56,7 +46,7 @@ pub fn launch_statsd_memory_thread<A: GlobalAlloc + Send + Sync>(allocator: &'st
                     |use_case, stat| {
                         metric!(
                             counter(AllocCounters::Alloc) += stat.current as i64,
-                            use_case = use_case.as_str()
+                            use_case = &format!("{:?}", use_case)
                         );
                     },
                     |err, count| {
