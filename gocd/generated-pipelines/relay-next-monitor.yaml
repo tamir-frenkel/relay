@@ -1,14 +1,14 @@
 format_version: 10
 pipelines:
-  deploy-relay-monitor:
+  deploy-relay-next-monitor:
     display_order: 2
     environment_variables:
       SENTRY_REGION: monitor
-    group: relay
+    group: relay-next
     lock_behavior: unlockWhenFinished
     materials:
-      deploy-relay-pipeline-complete:
-        pipeline: deploy-relay
+      deploy-relay-next-pipeline-complete:
+        pipeline: deploy-relay-next
         stage: pipeline-complete
       relay_repo:
         branch: master
