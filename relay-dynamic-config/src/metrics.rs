@@ -76,11 +76,6 @@ pub struct CustomMeasurementConfig {
     limit: usize,
 }
 
-/// Maximum supported version of metrics extraction from transactions.
-///
-/// The version is an integer scalar, incremented by one on each new version.
-const TRANSACTION_EXTRACT_VERSION: u16 = 1;
-
 /// Deprecated. Defines whether URL transactions should be considered low cardinality.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +111,11 @@ pub struct TransactionMetricsConfig {
 }
 
 impl TransactionMetricsConfig {
+    /// Maximum supported version of metrics extraction from transactions.
+    ///
+    /// The version is an integer scalar, incremented by one on each new version.
+    const VERSION: u16 = 1;
+
     /// Creates an enabled configuration with empty defaults.
     pub fn new() -> Self {
         Self {
@@ -126,7 +126,7 @@ impl TransactionMetricsConfig {
 
     /// Returns `true` if metrics extraction is enabled and compatible with this Relay.
     pub fn is_enabled(&self) -> bool {
-        self.version > 0 && self.version <= TRANSACTION_EXTRACT_VERSION
+        self.version > 0 && self.version <= Self::VERSION
     }
 }
 
@@ -159,6 +159,16 @@ pub struct MetricExtractionConfig {
     #[serde(default)]
     pub _conditional_tags_extended: bool,
 
+    /// This config has been extended with default transaction metrics.
+    ///
+    /// Relay checks for the transaction extraction flag and adds built-in metrics and tags to this
+    /// struct. If the flag is `true`, this has already happened and should not be repeated.
+    ///
+    /// This is a temporary flag that will be removed once the transaction metric extraction version
+    /// is bumped to `2`.
+    #[serde(default)]
+    pub _transaction_metrics_extended: bool,
+
     /// This config has been extended with default span metrics.
     ///
     /// Relay checks for the span extraction flag and adds built-in metrics and tags to this struct.
@@ -183,6 +193,7 @@ impl MetricExtractionConfig {
             metrics: Vec::new(),
             tags: Vec::new(),
             _conditional_tags_extended: false,
+            _transaction_metrics_extended: false,
             _span_metrics_extended: false,
         }
     }
