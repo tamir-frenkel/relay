@@ -31,6 +31,43 @@ struct SatisfactionThreshold {
     threshold: f64,
 }
 
+/// The metric on which the performance score is applied.
+#[derive(Debug, Clone, Serialize, Deserialize, Ord, Eq, PartialEq, PartialOrd)]
+#[serde(rename_all = "lowercase")]
+enum PerformanceScoreMetric {
+    Duration,
+    Lcp,
+    Fcp,
+    Fid,
+    Cls,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Ord, Eq, PartialEq, PartialOrd)]
+#[serde(rename_all = "lowercase")]
+enum PerformanceScoreOperation {
+    Pageload,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PerformanceScoreWeight {
+    metric: PerformanceScoreMetric,
+    mu: f64,
+    sigma: f64,
+    weight: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PerformanceScoreConfig {
+    transaction_op: PerformanceScoreOperation,
+    performance_score_weights: Vec<PerformanceScoreWeight>,
+}
+
 /// Configuration for applying the user satisfaction threshold.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +119,7 @@ pub struct TransactionMetricsConfig {
     extract_metrics: BTreeSet<String>,
     extract_custom_tags: BTreeSet<String>,
     satisfaction_thresholds: Option<SatisfactionConfig>,
+    performance_score_configs: Vec<PerformanceScoreConfig>,
     custom_measurements: CustomMeasurementConfig,
     accept_transaction_names: AcceptTransactionNames,
 }
@@ -351,6 +389,23 @@ fn extract_universal_tags(
     tags
 }
 
+fn complementary_log_normal_cdf(x: f64, sigma: f64, mu: f64) -> f64 {
+    // TODO(): Derive mu/signa from p10 / median instead
+    let two: f64 = 2.0;
+    let t_as = |x: f64| 1.0 / (1.0 + 0.3275911 * x.abs());
+    let e_rf = |x: f64| {
+        x.signum()
+            * (1.0
+                - (((((1.061405429 * t_as(x) - 1.453152027) * t_as(x)) + 1.421413741) * t_as(x)
+                    - 0.284496736)
+                    * t_as(x)
+                    + 0.254829592)
+                    * t_as(x)
+                    * (-x * x).exp())
+    };
+    0.5 * (1.0 - e_rf((x.ln() - mu) / (sigma * two.sqrt())))
+}
+
 pub fn extract_transaction_metrics(
     config: &TransactionMetricsConfig,
     conditional_tagging_config: &[TaggingRule],
@@ -396,6 +451,8 @@ fn extract_transaction_metrics_inner(
 
     let tags = extract_universal_tags(event, config);
 
+    println!("TEST");
+
     // Measurements
     if let Some(measurements) = event.measurements.value() {
         for (name, annotated) in measurements.iter() {
@@ -408,6 +465,15 @@ fn extract_transaction_metrics_inner(
                 Some(value) => *value,
                 None => continue,
             };
+
+            let fmtd = format!("measurements.{}", name);
+
+            println!(
+                "f={:?} Name {:?}, msmt: {:?} value={:?}",
+                fmtd, name, measurement, value
+            );
+
+            // Performance Score
 
             let mut tags_for_measurement = tags.clone();
             if let Some(rating) = get_measurement_rating(name, value) {
@@ -1093,8 +1159,6 @@ mod tests {
             }
         "#;
 
-
-
         let config = TransactionMetricsConfig::default();
         let event = Annotated::<Event>::from_json(json).unwrap();
 
@@ -1140,7 +1204,6 @@ mod tests {
             },
         ]
         "###);
-
     }
 
     #[test]
@@ -1190,6 +1253,60 @@ mod tests {
         let user_metric = &metrics[1];
         assert_eq!(user_metric.tags.len(), 3);
         assert_eq!(user_metric.tags["satisfaction"], "tolerated");
+    }
+
+    #[test]
+    fn test_performance_score() {
+        let json = r#"
+        {
+            "type": "transaction",
+            "transaction": "foo",
+            "start_timestamp": "2021-04-26T08:00:00+0100",
+            "timestamp": "2021-04-26T08:00:01+0100",
+            "user": {
+                "id": "user123"
+            },
+            "contexts": {
+                "trace": {
+                    "status": "ok"
+                }
+            },
+            "measurements": {
+                "fcp": {"value": 1.1, "unit": "second"},
+                "fid": {"value": 0.3, "unit": "second"},
+                "lcp": {"value": 2.2, "unit": "second"},
+                "cls": {"value": 0.3, "unit": "none"}
+            }
+        }
+        "#;
+
+        let event = Annotated::from_json(json).unwrap();
+
+        let config: TransactionMetricsConfig = serde_json::from_str(
+            r#"
+        {
+            "performanceScoreConfigs": [{
+                "transactionOp": "pageload",
+                "performanceScoreWeights": [{
+                    "metric": "lcp",
+                    "mu": 8.2940496401,
+                    "sigma": 0.54086518829,
+                    "weight": 20
+                }]
+            }]
+        }
+        "#,
+        )
+        .unwrap();
+        let mut metrics = vec![];
+        extract_transaction_metrics(&config, &[], event.value().unwrap(), &mut metrics);
+        assert_eq!(metrics.len(), 6);
+
+        let cls_metric = &metrics[0];
+        assert_eq!(cls_metric.name, "d:transactions/measurements.cls@none");
+        assert_eq!(cls_metric.tags.len(), 3);
+        assert_eq!(cls_metric.tags["measurement_rating"], "poor");
+        assert_eq!(cls_metric.tags["transaction.status"], "ok");
     }
 
     #[test]
