@@ -3,7 +3,7 @@
 //! The root type is [`RuleCondition`].
 
 use relay_common::glob3::GlobPatterns;
-use relay_protocol::{Getter, Val};
+use relay_protocol::{Getter, Getter2, Val};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 
@@ -90,6 +90,48 @@ impl EqCondition {
             _ => false,
         }
     }
+
+    fn matches2<T>(&self, instance: &T) -> bool
+    where
+        T: Getter2,
+    {
+        match (instance.get_value(self.name.as_str()), &self.value) {
+            (None, Value::Null) => true,
+            (Some(Val::String(f)), Value::String(ref val)) => self.cmp(f, val),
+            (Some(Val::String(f)), Value::Array(ref arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|v| self.cmp(v, f)),
+            (Some(Val::Uuid(f)), Value::String(ref val)) => Some(f) == val.parse().ok(),
+            (Some(Val::Bool(f)), Value::Bool(v)) => f == *v,
+            _ => false,
+        }
+    }
+
+    // fn matches2<T>(&self, instance: &T) -> bool
+    // where
+    //     T: Getter2,
+    // {
+    //     let Some(getter) = instance.get_path(self.name.as_str()) else {
+    //         return self.value.is_null();
+    //     };
+
+    //     if let Some(boolean) = getter.as_bool() {
+    //         Some(boolean) == self.value.as_bool()
+    //     } else if let Some(string) = getter.as_str() {
+    //         if let Some(expected) = self.value.as_str() {
+    //             expected == string
+    //         } else if let Some(array) = self.value.as_array() {
+    //             array.iter().any(|i| i.as_str() == Some(string))
+    //         } else {
+    //             false
+    //         }
+    //     } else if let Some(uuid) = getter.as_uuid() {
+    //         Some(uuid) == self.value.as_str().and_then(|s| s.parse().ok())
+    //     } else {
+    //         false
+    //     }
+    // }
 }
 
 macro_rules! impl_cmp_condition {

@@ -4,7 +4,9 @@ use std::str::FromStr;
 use relay_common::time;
 #[cfg(feature = "jsonschema")]
 use relay_jsonschema_derive::JsonSchema;
-use relay_protocol::{Annotated, Array, Empty, FromValue, Getter, IntoValue, Object, Val, Value};
+use relay_protocol::{
+    Annotated, Array, Empty, FromValue, Getter, GetterExt, IndexIter, IntoValue, Object, Val, Value,
+};
 #[cfg(feature = "jsonschema")]
 use schemars::{gen::SchemaGenerator, schema::Schema};
 use sentry_release_parser::Release as ParsedRelease;
@@ -704,6 +706,84 @@ impl Getter for Event {
                 }
             }
         })
+    }
+}
+
+impl relay_protocol::Getter2 for Event {
+    fn keys(&self) -> IndexIter<'_> {
+        IndexIter::from_slice(&[
+            "release",
+            // "release.build"
+            // "release.package"
+            // "release.version.short"
+            "dist",
+            "environment",
+            "transaction",
+            "platform",
+            "user",
+            // "user.email",
+            // "user.id",
+            // "user.ip_address",
+            // "user.name",
+            // "user.segment",
+            // "user.geo.city",
+            // "user.geo.country_code",
+            // "user.geo.region",
+            // "user.geo.subdivision",
+            "request",
+            // "request.method",
+            "contexts",
+            // "contexts.device.name",
+            // "contexts.device.family",
+            // "contexts.os.name",
+            // "contexts.os.version",
+            // "contexts.browser.name",
+            // "contexts.browser.version",
+            // "contexts.trace.status",
+            // "contexts.trace.op",
+            // "contexts.response.status_code",
+            "duration",
+            "measurements",
+            "breakdowns",
+            "extra",
+            "tags",
+        ])
+    }
+
+    fn get(&self, key: &str) -> Option<&dyn relay_protocol::Getter2> {
+        match key {
+            "release" => self.release.value().as_getter(),
+            "dist" => self.dist.value().as_getter(),
+            "environment" => self.environment.value().as_getter(),
+            "transaction" => self.transaction.value().as_getter(),
+            "platform" => self.platform.value().as_getter(),
+            "user" => self.user.value().as_getter(),
+            "request" => todo!(),
+            "contexts" => todo!(),
+            "duration" => todo!(),
+            "measurements" => todo!(),
+            "breakdowns" => todo!(),
+            "extra" => todo!(),
+            "tags" => todo!(),
+            _ => None,
+        }
+    }
+}
+
+impl relay_protocol::Getter2 for LenientString {
+    // #[inline]
+    // fn as_str(&self) -> Option<&str> {
+    //     Some(self.as_str())
+    // }
+
+    fn as_val(&self) -> Val<'_> {
+        Val::String(self)
+    }
+}
+
+impl relay_protocol::Getter2 for User {
+    fn as_val(&self) -> Val<'_> {
+        Val::Object(todo!("TODO(ja): Have to return something."))
     }
 }
 
