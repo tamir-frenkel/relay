@@ -776,16 +776,12 @@ impl relay_protocol::Getter2 for LenientString {
     //     Some(self.as_str())
     // }
 
-    fn as_val(&self) -> Val<'_> {
-        Val::String(self)
+    fn as_val(&self) -> Option<Val<'_>> {
+        Some(Val::String(self))
     }
 }
 
-impl relay_protocol::Getter2 for User {
-    fn as_val(&self) -> Val<'_> {
-        Val::Object(todo!("TODO(ja): Have to return something."))
-    }
-}
+impl relay_protocol::Getter2 for User {}
 
 #[cfg(test)]
 mod tests {

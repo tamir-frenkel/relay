@@ -232,7 +232,9 @@ pub trait Getter2: AsGetter {
 
     // OR ----------------------------------------
 
-    fn as_val(&self) -> Val<'_>;
+    fn as_val(&self) -> Option<Val<'_>> {
+        None
+    }
 
     // -------------------------------------------
 
@@ -260,7 +262,7 @@ pub trait Getter2: AsGetter {
     }
 
     fn get_value(&self, path: &str) -> Option<Val<'_>> {
-        Some(self.get_path(path)?.as_val())
+        self.get_path(path)?.as_val()
     }
 
     fn keys_at(&self, path: &str) -> IndexIter<'_> {
@@ -281,8 +283,8 @@ pub trait Getter2: AsGetter {
 // impl Getter2 for () {}
 
 impl Getter2 for bool {
-    fn as_val(&self) -> Val<'_> {
-        Val::Bool(*self)
+    fn as_val(&self) -> Option<Val<'_>> {
+        Some(Val::Bool(*self))
     }
 
     // #[inline]
@@ -307,8 +309,8 @@ impl Getter2 for i64 {
     //     todo!()
     // }
 
-    fn as_val(&self) -> Val<'_> {
-        Val::I64(*self)
+    fn as_val(&self) -> Option<Val<'_>> {
+        Some(Val::I64(*self))
     }
 }
 
@@ -328,8 +330,8 @@ impl Getter2 for u64 {
     //     todo!()
     // }
 
-    fn as_val(&self) -> Val<'_> {
-        Val::U64(*self)
+    fn as_val(&self) -> Option<Val<'_>> {
+        Some(Val::U64(*self))
     }
 }
 
@@ -349,8 +351,8 @@ impl Getter2 for f64 {
     //     Some(*self)
     // }
 
-    fn as_val(&self) -> Val<'_> {
-        Val::F64(*self)
+    fn as_val(&self) -> Option<Val<'_>> {
+        Some(Val::F64(*self))
     }
 }
 
@@ -360,8 +362,8 @@ impl Getter2 for String {
     //     Some(self)
     // }
 
-    fn as_val(&self) -> Val<'_> {
-        Val::String(self)
+    fn as_val(&self) -> Option<Val<'_>> {
+        Some(Val::String(self))
     }
 }
 
@@ -371,8 +373,8 @@ impl Getter2 for std::borrow::Cow<'_, str> {
     //     Some(self)
     // }
 
-    fn as_val(&self) -> Val<'_> {
-        Val::String(self)
+    fn as_val(&self) -> Option<Val<'_>> {
+        Some(Val::String(self))
     }
 }
 
@@ -382,8 +384,8 @@ impl Getter2 for Uuid {
     //     Some(*self)
     // }
 
-    fn as_val(&self) -> Val<'_> {
-        Val::Uuid(*self)
+    fn as_val(&self) -> Option<Val<'_>> {
+        Some(Val::Uuid(*self))
     }
 }
 
