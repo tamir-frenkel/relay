@@ -6,7 +6,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::meta::{Error, Meta};
-use crate::traits::{Empty, FromValue, IntoValue, SkipSerialization};
+use crate::traits::{Empty, FromValue, Getter2, IntoValue, SkipSerialization};
 use crate::value::{Map, Value};
 
 /// Represents a tree of meta objects.
@@ -378,6 +378,23 @@ impl<T> From<Option<T>> for Annotated<T> {
 impl<T> Default for Annotated<T> {
     fn default() -> Annotated<T> {
         Annotated::empty()
+    }
+}
+
+impl<T> Getter2 for Annotated<T>
+where
+    T: Getter2,
+{
+    fn as_val(&self) -> Option<crate::Val<'_>> {
+        self.value().and_then(Getter2::as_val)
+    }
+
+    fn get(&self, key: &str) -> Option<&dyn Getter2> {
+        self.value().and_then(|getter| getter.get(key))
+    }
+
+    fn keys(&self) -> crate::IndexIter<'_> {
+        self.value().map(Getter2::keys).unwrap_or_default()
     }
 }
 

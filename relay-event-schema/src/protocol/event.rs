@@ -752,18 +752,18 @@ impl relay_protocol::Getter2 for Event {
 
     fn get(&self, key: &str) -> Option<&dyn relay_protocol::Getter2> {
         match key {
-            "release" => self.release.value().as_getter(),
-            "dist" => self.dist.value().as_getter(),
-            "environment" => self.environment.value().as_getter(),
-            "transaction" => self.transaction.value().as_getter(),
-            "platform" => self.platform.value().as_getter(),
-            "user" => self.user.value().as_getter(),
+            "release" => todo!("new release struct"),
+            "dist" => self.dist.value().to_getter(),
+            "environment" => self.environment.value().to_getter(),
+            "transaction" => self.transaction.value().to_getter(),
+            "platform" => self.platform.value().to_getter(),
+            "user" => self.user.value().to_getter(),
             "request" => todo!(),
             "contexts" => todo!(),
-            "duration" => todo!(),
+            "duration" => todo!("move duration to normalization as field"),
             "measurements" => todo!(),
             "breakdowns" => todo!(),
-            "extra" => todo!(),
+            "extra" => self.extra.value().to_getter(),
             "tags" => todo!(),
             _ => None,
         }
@@ -781,7 +781,22 @@ impl relay_protocol::Getter2 for LenientString {
     }
 }
 
+// TODO(ja): Move and derive or implement
 impl relay_protocol::Getter2 for User {}
+
+// TODO(ja): Move and derive for PairList
+impl relay_protocol::Getter2 for Tags {
+    fn get(&self, key: &str) -> Option<&dyn relay_protocol::Getter2> {
+        self.get(key).to_getter()
+    }
+
+    fn keys(&self) -> IndexIter<'_> {
+        todo!()
+    }
+}
+
+// TODO(ja): Move and derive
+impl relay_protocol::Getter2 for ExtraValue {}
 
 #[cfg(test)]
 mod tests {

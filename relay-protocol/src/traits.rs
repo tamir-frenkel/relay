@@ -203,8 +203,10 @@ pub trait Getter {
 ///
 /// # Implementation
 ///
-/// - Either implement one of as_bool, as_i64, as_u64, as_f64, as_str, or as_uuid
-/// - Or implement get and keys together
+/// - Either implement [`Getter2::as_val`].
+/// - Or implement [`Getter2::get`] and [`Getter2::keys`]` together
+///
+/// It is also legal to implement both at the same time.
 pub trait Getter2: AsGetter {
     // fn as_bool(&self) -> Option<bool> {
     //     None
@@ -232,27 +234,71 @@ pub trait Getter2: AsGetter {
 
     // OR ----------------------------------------
 
+    /// Returns the simple val representation of this instance.
+    ///
+    /// Defaults to `None`. This should normally not be implemented for structs with fields.
     fn as_val(&self) -> Option<Val<'_>> {
         None
     }
 
     // -------------------------------------------
 
+    /// Returns a reference to the getter in the specified field.
+    ///
+    /// # Implementation
+    ///
+    /// Defaults to `None`. When implemented, [`Getter2::keys`] must be implemented too and return
+    /// the same set of keys supported by this function.
+    ///
+    /// By convention, this should not be implemented for primitive values as they do not contain
+    /// structured data.
     fn get(&self, key: &str) -> Option<&dyn Getter2> {
         None
     }
 
+    /// Iterates the keys of all fields in this instance.
+    ///
+    /// # Implementation
+    ///
+    /// Defaults to [`IndexIter::empty`]. This should return all fields supported by
+    /// [`Getter2::keys`].
+    ///
+    /// To implement this for a struct with known fields, use [`IndexIter::from_slice`] and pass a
+    /// slice containing static field names.
+    ///
+    /// ```
+    /// todo!("example")
+    /// ```
+    ///
+    /// To implement
+    ///
+    /// ```
+    /// todo!("example")
+    /// ```
+    ///
+    /// By convention, this should not be implemented for primitive values as they do not contain
+    /// structured data.
     fn keys(&self) -> IndexIter<'_> {
         IndexIter::empty()
     }
 
+    /// Iterates all fields along with references to their getters.
+    ///
+    /// # Implementation
+    ///
+    /// This method is provided for all implementors and does not have to be implemented.
     fn iter(&self) -> Iter<'_> {
         Iter {
-            getter: Some(self.as_getter()),
+            getter: self.as_getter(),
             indexes: self.keys(),
         }
     }
 
+    /// Resolves the getter at a specified path, if it exists.
+    ///
+    /// Returns `None` if either any field along the path does not exist, or one of the fields is
+    /// `None`. To retrieve the value of the getter, use [`as_val`](Getter2::as_val) on the returned
+    /// reference or call [`get_value`](Getter2::get_value) directly.
     fn get_path(&self, path: &str) -> Option<&dyn Getter2> {
         let mut current = self.as_getter();
         for component in path.split('.') {
@@ -261,10 +307,18 @@ pub trait Getter2: AsGetter {
         Some(current)
     }
 
+    /// Resolves the [`Val`] at the specified path, if it exists.
+    ///
+    /// Returns `None` if either any field along the path does not exist, one of the fields is
+    /// `None`, or the getter at the target returns `None` for [`as_val`](Getter2::as_val). To
+    /// retrieve a reference to the getter instead, call [`get_path`](Getter2::get_path).
     fn get_value(&self, path: &str) -> Option<Val<'_>> {
         self.get_path(path)?.as_val()
     }
 
+    /// Iterates keys at the given path.
+    ///
+    /// This is a shorthand for calling `.get_path(path).keys()`.
     fn keys_at(&self, path: &str) -> IndexIter<'_> {
         match self.get_path(path) {
             Some(getter) => getter.keys(),
@@ -272,6 +326,9 @@ pub trait Getter2: AsGetter {
         }
     }
 
+    /// Iterates keys and values at the given path.
+    ///
+    /// This is a shorthand for calling `.get_path(path).iter()`.
     fn iter_at(&self, path: &str) -> Iter<'_> {
         match self.get_path(path) {
             Some(getter) => getter.iter(),
@@ -280,7 +337,7 @@ pub trait Getter2: AsGetter {
     }
 }
 
-// impl Getter2 for () {}
+impl Getter2 for () {}
 
 impl Getter2 for bool {
     fn as_val(&self) -> Option<Val<'_>> {
@@ -389,7 +446,75 @@ impl Getter2 for Uuid {
     }
 }
 
-trait AsGetter {
+impl Getter2 for Value {
+    fn as_val(&self) -> Option<Val<'_>> {
+        Some(self.into())
+    }
+
+    fn get(&self, key: &str) -> Option<&dyn Getter2> {
+        match self {
+            Value::Bool(_) => None,
+            Value::I64(_) => None,
+            Value::U64(_) => None,
+            Value::F64(_) => None,
+            Value::String(_) => None,
+            Value::Array(_) => todo!("implement index for arrays"),
+            Value::Object(object) => Getter2::get(object, key),
+        }
+    }
+
+    fn keys(&self) -> IndexIter<'_> {
+        match self {
+            Value::Bool(_) => IndexIter::empty(),
+            Value::I64(_) => IndexIter::empty(),
+            Value::U64(_) => IndexIter::empty(),
+            Value::F64(_) => IndexIter::empty(),
+            Value::String(_) => IndexIter::empty(),
+            Value::Array(_) => todo!(),
+            Value::Object(object) => IndexIter::new(Getter2::keys(object)),
+        }
+    }
+}
+
+impl<T> Getter2 for Option<T>
+where
+    T: Getter2,
+{
+    #[inline]
+    fn as_val(&self) -> Option<Val<'_>> {
+        self.as_ref().and_then(Getter2::as_val)
+    }
+
+    #[inline]
+    fn get(&self, key: &str) -> Option<&dyn Getter2> {
+        self.as_ref().and_then(|getter| getter.get(key))
+    }
+
+    #[inline]
+    fn keys(&self) -> IndexIter<'_> {
+        self.as_ref().map(Getter2::keys).unwrap_or_default()
+    }
+}
+
+impl<K, V> Getter2 for BTreeMap<K, V>
+where
+    K: std::borrow::Borrow<str> + Ord,
+    V: Getter2,
+{
+    fn get(&self, key: &str) -> Option<&dyn Getter2> {
+        self.get(key).to_getter()
+    }
+
+    fn keys(&self) -> IndexIter<'_> {
+        IndexIter::new(self.keys().map(|k| k.borrow()))
+    }
+}
+
+/// Helper trait that converts references to types implementing [`Getter2`] into a trait object.
+///
+/// This trait is automatically implemented by all types implementing [`Getter2`].
+pub trait AsGetter {
+    /// Returns the reference to the trait object.
     fn as_getter(&self) -> &dyn Getter2;
 }
 
@@ -402,17 +527,29 @@ where
     }
 }
 
+/// Convenience helper for working with options of [`Getter2`].
 pub trait GetterExt<'a> {
-    fn as_getter(self) -> Option<&'a dyn Getter2>;
+    /// Returns this type cast as optional trait object.
+    fn to_getter(self) -> Option<&'a dyn Getter2>;
 }
+
+// impl<'a, T> GetterExt<'a> for &'a T
+// where
+//     T: Getter2,
+// {
+//     #[inline]
+//     fn to_getter(self) -> Option<&'a dyn Getter2> {
+//         Some(self as _)
+//     }
+// }
 
 impl<'a, T> GetterExt<'a> for &'a Option<T>
 where
     T: Getter2,
 {
     #[inline]
-    fn as_getter(self) -> Option<&'a dyn Getter2> {
-        self.as_ref().as_getter()
+    fn to_getter(self) -> Option<&'a dyn Getter2> {
+        self.as_ref().to_getter()
     }
 }
 
@@ -421,7 +558,7 @@ where
     T: Getter2,
 {
     #[inline]
-    fn as_getter(self) -> Option<&'a dyn Getter2> {
+    fn to_getter(self) -> Option<&'a dyn Getter2> {
         self.map(|v| v as _)
     }
 }
@@ -431,6 +568,7 @@ enum IndexIterRepr<'a> {
     Dyn(Box<dyn Iterator<Item = &'a str> + 'a>),
 }
 
+/// Iterator over keys in a [`Getter2`], returned by [`keys`](Getter2::keys).
 pub struct IndexIter<'a> {
     repr: IndexIterRepr<'a>,
 }
@@ -442,10 +580,12 @@ impl Default for IndexIter<'_> {
 }
 
 impl<'a> IndexIter<'a> {
+    /// Creates an iterator that will not yield any values.
     pub fn empty() -> Self {
         Self::from_slice(&[])
     }
 
+    /// Creates an iterator that yields from the provided `iter`.
     pub fn new<I>(iter: I) -> Self
     where
         I: Iterator<Item = &'a str> + 'a,
@@ -455,6 +595,7 @@ impl<'a> IndexIter<'a> {
         }
     }
 
+    /// Creates an iterator that yields the elements of the provided `slice`.
     pub fn from_slice(slice: &'a [&'a str]) -> Self {
         Self {
             repr: IndexIterRepr::Slice(slice.iter()),
@@ -497,15 +638,17 @@ impl<'a> Iterator for IndexIter<'a> {
     }
 }
 
+/// Iterator over keys and references to their values in a [`Getter2`], returned by
+/// [`iter`](Getter2::iter).
 pub struct Iter<'a> {
-    getter: Option<&'a dyn Getter2>,
+    getter: &'a dyn Getter2,
     indexes: IndexIter<'a>,
 }
 
 impl Iter<'_> {
     fn empty() -> Self {
         Self {
-            getter: None,
+            getter: &(),
             indexes: IndexIter::empty(),
         }
     }
@@ -516,7 +659,7 @@ impl<'a> Iterator for Iter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let index = self.indexes.next()?;
-        Some((index, self.getter?.get(index)))
+        Some((index, self.getter.get(index)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -532,6 +675,131 @@ impl<'a> Iterator for Iter<'a> {
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         let index = self.indexes.nth(n)?;
-        Some((index, self.getter?.get(index)))
+        Some((index, self.getter.get(index)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use similar_asserts::assert_eq;
+
+    use super::*;
+
+    struct Outer {
+        foo: Foo,
+        bar: Bar,
+    }
+
+    impl Getter2 for Outer {
+        fn get(&self, key: &str) -> Option<&dyn Getter2> {
+            match key {
+                "foo" => Some(&self.foo as _),
+                "bar" => Some(&self.bar as _),
+                _ => None,
+            }
+        }
+
+        fn keys(&self) -> IndexIter<'_> {
+            IndexIter::from_slice(&["foo", "bar"])
+        }
+    }
+
+    struct Foo {
+        value: String,
+    }
+
+    impl Getter2 for Foo {
+        fn get(&self, key: &str) -> Option<&dyn Getter2> {
+            match key {
+                "value" => Some(&self.value as _),
+                _ => None,
+            }
+        }
+
+        fn keys(&self) -> IndexIter<'_> {
+            IndexIter::from_slice(&["value"])
+        }
+    }
+
+    struct Bar {
+        value: u64,
+    }
+
+    impl Getter2 for Bar {
+        fn get(&self, key: &str) -> Option<&dyn Getter2> {
+            match key {
+                "value" => Some(&self.value as _),
+                _ => None,
+            }
+        }
+
+        fn keys(&self) -> IndexIter<'_> {
+            IndexIter::from_slice(&["value"])
+        }
+    }
+
+    #[test]
+    fn get() {
+        let bar = Bar { value: 42 };
+        let getter = Getter2::get(&bar, "value").unwrap();
+        assert_eq!(getter.as_val().unwrap(), 42u64.into());
+    }
+
+    #[test]
+    fn get_unknown() {
+        let bar = Bar { value: 42 };
+        assert!(Getter2::get(&bar, "unknown").is_none());
+    }
+
+    #[test]
+    fn keys() {
+        let foo = Outer {
+            foo: Foo {
+                value: "test".to_string(),
+            },
+            bar: Bar { value: 42 },
+        };
+
+        let keys: Vec<_> = Getter2::keys(&foo).collect();
+        assert_eq!(keys, &["foo", "bar"]);
+    }
+
+    #[test]
+    fn get_path() {
+        let foo = Outer {
+            foo: Foo {
+                value: "test".to_string(),
+            },
+            bar: Bar { value: 42 },
+        };
+
+        let getter = Getter2::get_path(&foo, "foo.value").unwrap();
+        assert_eq!(getter.as_val().unwrap(), "test".into());
+    }
+
+    #[test]
+    fn get_value() {
+        let foo = Outer {
+            foo: Foo {
+                value: "test".to_string(),
+            },
+            bar: Bar { value: 42 },
+        };
+
+        let val = Getter2::get_value(&foo, "foo.value").unwrap();
+        assert_eq!(val, "test".into());
+    }
+
+    #[test]
+    fn keys_at() {
+        let foo = Outer {
+            foo: Foo {
+                value: "test".to_string(),
+            },
+            bar: Bar { value: 42 },
+        };
+
+        let keys: Vec<_> = Getter2::keys_at(&foo, "foo").collect();
+        assert_eq!(keys, &["value"]);
     }
 }
