@@ -488,7 +488,7 @@ impl StoreService {
         message: KafkaMessage,
     ) -> Result<(), StoreError> {
         relay_log::trace!("Sending kafka message of type {}", message.variant());
-
+        println!("{:?}", topic);
         self.producer
             .client
             .send_message(topic, organization_id, &message)?;

@@ -302,9 +302,19 @@ class SentryLike:
         envelope.add_item(Item(PayloadRef(json=payload), type="client_report"))
         self.send_envelope(project_id, envelope)
 
-    def send_user_feedback(self, project_id, payload):
+    def send_user_feedback(self, project_id, payload, attachment=None):
         envelope = Envelope()
         envelope.add_item(Item(PayloadRef(json=payload), type="feedback"))
+        if attachment:
+            print("BAAAA?")
+            envelope.add_item(
+                Item(
+                    headers=[["attachment_type", "event.attachment"]],
+                    type="attachment",
+                    payload=PayloadRef(bytes=attachment),
+                )
+            )
+
         self.send_envelope(project_id, envelope)
 
     def send_user_report(self, project_id, payload):

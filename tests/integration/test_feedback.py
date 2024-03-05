@@ -102,6 +102,72 @@ def test_feedback_event_with_processing(
     }
 
 
+def test_feedback_event_and_attachment_with_processing(
+    mini_sentry, relay_with_processing, events_consumer, attachments_consumer
+):
+    relay = relay_with_processing()
+    mini_sentry.add_basic_project_config(
+        42, extra={"config": {"features": ["organizations:user-feedback-ingest"]}}
+    )
+
+    _events_consumer = events_consumer(timeout=5)
+    attachments_consumer = attachments_consumer()
+
+    feedback = generate_feedback_sdk_event()
+
+    attachment = b"heavens no"
+
+    relay.send_user_feedback(42, feedback, attachment=attachment)
+
+    replay_event, replay_event_message = _events_consumer.get_event()
+    print("zzzzzzz")
+    print(replay_event, replay_event_message)
+    assert replay_event["type"] == "feedback"
+    # assert replay_event_message["retention_days"] == 90
+
+    parsed_feedback = json.loads(bytes(replay_event_message["payload"]))
+    # Assert required fields were returned.
+    assert parsed_feedback["event_id"]
+    assert parsed_feedback["type"] == feedback["type"]
+    assert parsed_feedback["dist"] == feedback["dist"]
+    assert parsed_feedback["platform"] == feedback["platform"]
+    assert parsed_feedback["environment"] == feedback["environment"]
+    assert parsed_feedback["release"] == str(feedback["release"])
+    assert parsed_feedback["sdk"]["name"] == feedback["sdk"]["name"]
+    assert parsed_feedback["sdk"]["version"] == feedback["sdk"]["version"]
+    assert parsed_feedback["user"]["id"] == feedback["user"]["id"]
+    assert parsed_feedback["user"]["username"] == feedback["user"]["username"]
+    assert parsed_feedback["user"]["ip_address"] == feedback["user"]["ip_address"]
+
+    assert parsed_feedback["user"]["email"] == "[email]"
+    assert parsed_feedback["timestamp"]
+
+    # Assert the tags and requests objects were normalized to lists of doubles.
+    assert parsed_feedback["tags"] == [["transaction", feedback["tags"]["transaction"]]]
+    assert parsed_feedback["request"] == {
+        "headers": [["User-Agent", feedback["request"]["headers"]["user-Agent"]]]
+    }
+
+    # Assert contexts object was pulled out.
+    assert parsed_feedback["contexts"] == {
+        "browser": {"name": "Safari", "version": "15.5", "type": "browser"},
+        "device": {"brand": "Apple", "family": "Mac", "model": "Mac", "type": "device"},
+        "os": {"name": "Mac OS X", "version": ">=10.15.7", "type": "os"},
+        "replay": {"replay_id": "e2d42047b1c5431c8cba85ee2a8ab25d", "type": "replay"},
+        "trace": {
+            "status": "unknown",
+            "trace_id": "4c79f60c11214eb38604f4ae0781bfb2",
+            "span_id": "fa90fdead5f74052",
+            "type": "trace",
+        },
+        "feedback": {
+            "message": "test message",
+            "contact_email": "test@example.com",
+            "type": "feedback",
+        },
+    }
+
+
 def test_feedback_events_without_processing(mini_sentry, relay_chain):
     relay = relay_chain(min_relay_version="latest")
 
