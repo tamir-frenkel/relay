@@ -423,6 +423,9 @@ fn set_segment_attributes(span: &mut Annotated<Span>) {
     } else if span.parent_span_id.is_empty() {
         // If the span has no parent, it is automatically a segment:
         span.is_segment = true.into();
+    } else {
+        // We don't know, but `is_segment` is a required field. Assume false.
+        span.is_segment.get_or_insert_with(bool::default);
     }
 
     // If the span is a segment, always set the segment_id to the current span_id:
@@ -777,6 +780,19 @@ mod tests {
         set_segment_attributes(&mut span);
         assert_eq!(get_value!(span.is_segment!), &true);
         assert_eq!(get_value!(span.segment_id!).0.as_str(), "fa90fdead5f74052");
+    }
+
+    #[test]
+    fn segment_assume_false() {
+        let mut span: Annotated<Span> = Annotated::from_json(
+            r#"{
+            "span_id": "fa90fdead5f74052",
+            "parent_span_id": "fa90fdead5f74051"
+        }"#,
+        )
+        .unwrap();
+        set_segment_attributes(&mut span);
+        assert_eq!(get_value!(span.is_segment!), &false);
     }
 
     #[test]
