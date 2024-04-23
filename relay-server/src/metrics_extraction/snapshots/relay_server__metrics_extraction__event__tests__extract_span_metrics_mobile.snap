@@ -345,6 +345,9 @@ expression: "(&event.value().unwrap().spans, metrics)"
                 user: ~,
                 replay_id: ~,
                 sdk_name: ~,
+                frames_slow: ~,
+                frames_frozen: ~,
+                frames_total: ~,
                 other: {},
             },
             sentry_tags: {
@@ -428,6 +431,9 @@ expression: "(&event.value().unwrap().spans, metrics)"
                 user: ~,
                 replay_id: ~,
                 sdk_name: ~,
+                frames_slow: ~,
+                frames_frozen: ~,
+                frames_total: ~,
                 other: {},
             },
             sentry_tags: {
