@@ -354,7 +354,7 @@ fn span_metrics(
         MetricSpec {
             category: DataCategory::Span,
             mri: "d:spans/cache.item_size@byte".into(),
-            field: Some("span.data.cache\\.item_size".into()),
+            field: Some("span.measurements.cache.item_size.value".into()),
             condition: Some(is_cache.clone()),
             tags: vec![
                 Tag::with_key("environment")
