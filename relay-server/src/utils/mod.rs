@@ -8,6 +8,7 @@ mod managed_envelope;
 mod metrics_rate_limits;
 mod multipart;
 mod param_parser;
+mod partition;
 mod pick;
 mod rate_limits;
 mod retry;
@@ -33,6 +34,7 @@ pub use self::multipart::*;
 #[cfg(feature = "processing")]
 pub use self::native::*;
 pub use self::param_parser::*;
+pub use self::partition::*;
 pub use self::pick::*;
 pub use self::rate_limits::*;
 pub use self::retry::*;

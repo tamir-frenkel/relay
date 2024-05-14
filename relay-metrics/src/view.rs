@@ -118,6 +118,24 @@ where
         }
     }
 
+    /// Resets the internal tracked range to the supplied bucket boundaries.
+    ///
+    /// This function does not respect prior set bounds, meaning it can be
+    /// used to **grow** the view.
+    pub(crate) fn select(self, start: usize, end: usize) -> Self {
+        Self {
+            inner: self.inner,
+            start: Index {
+                slice: start,
+                bucket: 0,
+            },
+            end: Index {
+                slice: end,
+                bucket: 0,
+            },
+        }
+    }
+
     /// Iterator over all buckets in the view.
     pub fn iter(&self) -> BucketsViewIter<'_> {
         BucketsViewIter::new(self.inner.as_ref(), self.start, self.end)

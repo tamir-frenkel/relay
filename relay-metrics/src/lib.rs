@@ -75,6 +75,7 @@ pub mod meta;
 mod aggregatorservice;
 mod bucket;
 mod finite;
+mod partition;
 mod protocol;
 mod router;
 mod statsd;
@@ -86,6 +87,7 @@ pub use finite::*;
 #[cfg(feature = "redis")]
 pub use meta::RedisMetricMetaStore;
 pub use meta::{MetaAggregator, MetricMeta};
+pub use partition::*;
 pub use protocol::*;
 pub use router::*;
 pub use view::*;

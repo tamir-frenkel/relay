@@ -2459,7 +2459,7 @@ impl EnvelopeProcessorService {
     }
 
     /// Creates a [`SendMetricsRequest`] and sends it to the upstream relay.
-    fn send_global_partition(&self, key: Option<u64>, partition: &mut Partition<'_>) {
+    fn send_global_partition(&self, key: Option<u64>, partition: BucketsView<Arc<[Bucket]>>) {
         if partition.is_empty() {
             return;
         }
@@ -2508,13 +2508,23 @@ impl EnvelopeProcessorService {
 
         let mut partitions = BTreeMap::new();
 
-        for (scoping, message) in &message.scopes {
+        for (scoping, message) in message.scopes {
             let ProjectMetrics {
                 buckets,
                 project_state,
             } = message;
 
             let mode = project_state.get_extraction_mode();
+
+            let partitions = relay_metrics::partition(buckets, |bucket| {
+                partition_key(scoping.project_key, bucket, partition_count)
+            });
+
+            for (key, buckets) in partitions {
+                for buckets in buckets.by_size(batch_size) {
+                    self.send_global_partition(key, partition);
+                }
+            }
 
             for bucket in buckets {
                 let partition_key = partition_key(scoping.project_key, bucket, partition_count);
