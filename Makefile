@@ -144,7 +144,7 @@ init-submodules:
 setup-git: .git/hooks/pre-commit init-submodules ## make sure all git configured and all the submodules are fetched
 .PHONY: setup-git
 
-setup-venv: .venv/bin/python .venv/python-requirements-stamp ## create a Python virtual environment with development requirements installed
+setup-venv: .venv/python-requirements-stamp ## create a Python virtual environment with development requirements installed
 .PHONY: setup-venv
 
 clean-target-dir:
@@ -155,19 +155,8 @@ clean-target-dir:
 
 # Dependencies
 
-.venv/bin/python: Makefile
-	rm -rf .venv
-
-	@# --copies is necessary because OS X make checks the mtime of the symlink
-	@# target (/usr/local/bin/python), which is always much older than the
-	@# Makefile, and then proceeds to unconditionally rebuild the venv.
-	$$RELAY_PYTHON_VERSION -m venv --copies .venv
-	.venv/bin/pip install -U pip wheel
-
-.venv/python-requirements-stamp: requirements-dev.txt
-	.venv/bin/pip install -U -r requirements-dev.txt
-	RELAY_DEBUG=1 .venv/bin/pip install -v --editable py
-	# Bump the mtime of an empty file.
+.venv/python-requirements-stamp: requirements-dev.txt devenv/config.ini devenv/sync.py
+	devenv sync
 	# Make will re-run 'pip install' if the mtime on requirements-dev.txt is higher again.
 	touch .venv/python-requirements-stamp
 
