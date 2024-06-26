@@ -954,11 +954,11 @@ fn default_max_secs_in_future() -> u32 {
 }
 
 fn default_max_secs_in_past() -> u32 {
-    30 * 24 * 3600 // 30 days
+    730 * 24 * 3600 // 30 days
 }
 
 fn default_max_session_secs_in_past() -> u32 {
-    5 * 24 * 3600 // 5 days
+    730 * 24 * 3600 // 5 days
 }
 
 fn default_chunk_size() -> ByteSize {
