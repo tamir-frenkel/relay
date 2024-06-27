@@ -285,7 +285,7 @@ impl Default for AggregatorConfig {
         Self {
             bucket_interval: 10,
             initial_delay: 30,
-            max_secs_in_past: 5 * 24 * 60 * 60, // 5 days, as for sessions
+            max_secs_in_past: 730 * 24 * 60 * 60, // 5 days, as for sessions
             max_secs_in_future: 60,             // 1 minute
             max_name_length: 200,
             max_tag_key_length: 200,
